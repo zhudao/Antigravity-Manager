@@ -2,6 +2,37 @@
 
 本目錄包含 Antigravity Manager 的原生 Headless Docker 部署方案。該方案支持完整的 Web 管理界面、API 反代以及數據持久化，無需複雜的 VNC 或桌面環境。
 
+## 🆕 本版本部署方案（本地前端構建復用）
+適用於「前端近期不改、後端經常調整」的場景。思路是先在本地生成 `dist/`，Docker 只編譯後端並直接拷貝 `dist/`，大幅縮短構建時間並降低前端構建風險。
+
+**步驟**
+1. 本地生成前端靜態資源：
+```bash
+npm ci --legacy-peer-deps
+npm run build
+```
+2. 使用本方案構建與啟動（後端-only + 復用 `dist/`）：
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.yml build
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.yml up -d
+```
+或合併為單條命令：
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.yml up -d --build
+```
+
+啟動後動態查看日誌：
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.yml logs -f --tail=200
+```
+
+**更新方式**
+- 後端有改動：重跑上面的 `build` + `up -d`
+- 前端有改動：先在本地重新 `npm run build`，再重跑 `build` + `up -d`
+
+**Git 部署提醒**
+- 若服務器不在本地構建前端，請確保 `dist/` 已提交到倉庫（本版本已從 `.gitignore` 移除）。
+
 ## 🚀 快速開始
 
 ### 1. 直接拉取鏡像 (推薦)
@@ -25,6 +56,24 @@ docker run -d \
   -v ~/.antigravity_tools:/root/.antigravity_tools \
   lbjlaq/antigravity-manager:latest
 ```
+
+> [!TIP]
+> **🧪 體驗 Beta / 預覽版鏡像**：
+> 若需使用最新的 Beta 預發布特性，請拉取對應的 Beta 版本 Tag（預發布版本獨立構建發布，不會覆蓋 `latest` 穩定版標籤）：
+> ```bash
+> # 拉取指定 Beta 預發布版本
+> docker pull lbjlaq/antigravity-manager:v4.8.2-beta.0
+> 
+> # 運行 Beta 容器
+> docker run -d --name antigravity-manager-beta \
+>   -p 8045:8045 \
+>   -e API_KEY=your-api-key \
+>   -e WEB_PASSWORD=your-login-password \
+>   -e ABV_MAX_BODY_SIZE=104857600 \
+>   -v ~/.antigravity_tools:/root/.antigravity_tools \
+>   lbjlaq/antigravity-manager:v4.8.2-beta.0
+> ```
+> 完整版本標籤請查看 [Docker Hub Tags](https://hub.docker.com/r/lbjlaq/antigravity-manager/tags)。若需直接運行未發版 Tag 的當前最新 `beta` 分支源碼，可在本地構建：`docker build -t lbjlaq/antigravity-manager:beta -f docker/Dockerfile .`。
 
 #### 🔐 鑒權邏輯 (Security Scenarios)
 *   **場景 A：僅設置了 `API_KEY`**
@@ -51,11 +100,28 @@ docker run -d \
 docker compose up -d
 ```
 
-### 3. 手動構建鏡像 (開發者)
+### 3. 手動構建鏡像 (開發者 / 二改版)
 如果您需要修改代碼或自定義構建，請在項目根目錄下執行：
+
+**Windows PowerShell（推薦）**
+```powershell
+# 一鍵構建二改版鏡像（標籤 antigravity-manager:local + 版本-fix）
+.\docker\build.ps1
+
+# 国内網絡加速
+.\docker\build.ps1 -UseMirror
+
+# 構建並推送到你自己的倉庫
+.\docker\build.ps1 -UseMirror -Push -Registry "yourname/antigravity-manager"
+```
+
+**手動 docker build**
 ```bash
 # 默認構建最新標籤
-docker build -t antigravity-manager:latest -f docker/Dockerfile .
+docker build -t antigravity-manager:local -f docker/Dockerfile .
+
+# 二改版 Compose 啟動（Windows 可用端口映射，不用 host 網絡）
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.fork.yml up -d --build
 ```
 
 #### 💡 構建參數
@@ -95,7 +161,7 @@ docker build --build-arg USE_MIRROR=true -t antigravity-manager:latest -f docker
 ```bash
 # 打上版本標籤並推送
 docker tag antigravity-manager:latest lbjlaq/antigravity-manager:latest
-docker tag antigravity-manager:latest lbjlaq/antigravity-manager:4.0.5
+docker tag antigravity-manager:latest lbjlaq/antigravity-manager:4.3.0
 docker push lbjlaq/antigravity-manager:latest
-docker push lbjlaq/antigravity-manager:4.0.5
+docker push lbjlaq/antigravity-manager:4.3.0
 ```

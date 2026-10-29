@@ -3,7 +3,11 @@
 //! Responsible for estimating token usage and purifying context (stripping thinking blocks)
 //! to prevent "Prompt is too long" errors and avoid invalid signatures.
 
+use super::caveman_cleaner::CavemanCleaner;
 use super::claude::models::{ClaudeRequest, ContentBlock, Message, MessageContent, SystemPrompt};
+use super::openai::models::{OpenAIMessage, OpenAIRequest};
+use super::rtk_cleaner::RtkCleaner;
+use serde_json::{json, Value};
 use tracing::{debug, info};
 
 /// Helper to estimate tokens from text with multi-language awareness
@@ -36,10 +40,108 @@ fn estimate_tokens_from_str(s: &str) -> u32 {
     ((ascii_tokens + unicode_tokens) as f32 * 1.15).ceil() as u32
 }
 
+/// Estimate token cost for an image from an OpenAI-format image_url.
+/// Handles both base64 data URLs and remote URLs.
+/// Gemini counts standard images at ~258 tokens. For very large images
+/// (>1MB base64 payload), we scale up since high-res images tokenize higher.
+fn estimate_image_tokens_from_url(url: &str) -> u32 {
+    const BASE_IMAGE_TOKENS: u32 = 258;
+
+    if url.starts_with("data:") {
+        // data:image/png;base64,<data>
+        // Extract the base64 portion after the comma
+        if let Some(comma_pos) = url.find(',') {
+            let base64_len = url.len() - comma_pos - 1;
+            // Approximate raw bytes: base64 encodes 3 bytes into 4 chars
+            let raw_bytes = (base64_len * 3) / 4;
+
+            // Gemini: standard images = 258 tokens
+            // High-res images (>1MB) scale higher, up to ~10k tokens for very large ones
+            if raw_bytes > 4_000_000 {
+                // >4MB: very high resolution
+                10_000
+            } else if raw_bytes > 1_000_000 {
+                // 1-4MB: high resolution, scale linearly
+                let factor = raw_bytes as f32 / 1_000_000.0;
+                (BASE_IMAGE_TOKENS as f32 * factor * 4.0).ceil() as u32
+            } else {
+                BASE_IMAGE_TOKENS
+            }
+        } else {
+            BASE_IMAGE_TOKENS
+        }
+    } else {
+        // Remote URL: assume standard resolution
+        BASE_IMAGE_TOKENS
+    }
+}
+
+/// Estimate token cost for audio from a URL.
+/// Audio is tokenized at roughly 32 tokens per second.
+/// From base64, we estimate duration from payload size.
+fn estimate_media_tokens_from_url(url: &str) -> u32 {
+    const BASE_AUDIO_TOKENS: u32 = 500; // ~15 seconds default
+
+    if url.starts_with("data:") {
+        if let Some(comma_pos) = url.find(',') {
+            let base64_len = url.len() - comma_pos - 1;
+            let raw_bytes = (base64_len * 3) / 4;
+            // Rough estimate: 16kHz, 16-bit mono audio ≈ 32KB/s
+            // 32 tokens/second
+            let estimated_seconds = raw_bytes as f32 / 32_000.0;
+            let tokens = (estimated_seconds * 32.0).ceil() as u32;
+            tokens.max(64) // minimum 64 tokens for any audio
+        } else {
+            BASE_AUDIO_TOKENS
+        }
+    } else {
+        BASE_AUDIO_TOKENS
+    }
+}
+
+/// Estimate token cost for Gemini inlineData (base64 images/audio in Gemini format).
+/// mime_type determines the estimation strategy. data_len is the length of the base64 string.
+fn estimate_inline_data_tokens(mime_type: &str, data_len: usize) -> u32 {
+    if mime_type.starts_with("image/") {
+        // Same logic as estimate_image_tokens_from_url for base64
+        let raw_bytes = (data_len * 3) / 4;
+        if raw_bytes > 4_000_000 {
+            10_000
+        } else if raw_bytes > 1_000_000 {
+            let factor = raw_bytes as f32 / 1_000_000.0;
+            (258.0 * factor * 4.0).ceil() as u32
+        } else {
+            258
+        }
+    } else if mime_type.starts_with("audio/") {
+        let raw_bytes = (data_len * 3) / 4;
+        let estimated_seconds = raw_bytes as f32 / 32_000.0;
+        (estimated_seconds * 32.0).ceil().max(64.0) as u32
+    } else {
+        // Unknown media: treat as text approximation
+        estimate_tokens_from_str(&format!("[binary data: {} bytes]", data_len))
+    }
+}
+
+/// [FIX #3325] Estimate raw input tokens directly from an incoming JSON payload string (OpenAI, Claude, or Gemini format)
+/// Used as a fallback when upstream returns an error status (>=400) without token usage metadata.
+/// 接入 Pipeline 协议无关通用估算引擎与全局高并发内容哈希缓存。
+pub fn estimate_raw_tokens_from_payload(payload: &str) -> u32 {
+    if payload.is_empty() {
+        return 0;
+    }
+    if let Ok(json) = serde_json::from_str::<Value>(payload) {
+        return crate::proxy::pipeline::estimate_tokens(&json);
+    }
+    // Fallback: estimate from raw string
+    crate::proxy::pipeline::estimator::estimate_tokens_from_str(payload)
+}
+
 /// Strategy for context purification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurificationStrategy {
     /// Soft purification: Retains recent thinking blocks (~2 turns), removes older ones
+    #[allow(dead_code)]
     Soft,
     /// Aggressive purification: Removes ALL thinking blocks to save maximum tokens
     Aggressive,
@@ -59,7 +161,90 @@ impl ContextManager {
             PurificationStrategy::Aggressive => 0, // No protection
         };
 
-        Self::strip_thinking_blocks(messages, protected_last_n)
+        let mut modified = Self::strip_thinking_blocks(messages, protected_last_n);
+
+        // Apply Caveman cleaning to older message contents to save tokens
+        let total_msgs = messages.len();
+        let start_protection_idx = total_msgs.saturating_sub(protected_last_n);
+        for (i, msg) in messages.iter_mut().enumerate() {
+            if i >= start_protection_idx {
+                continue;
+            }
+            if msg.role == "user" || msg.role == "assistant" {
+                match &mut msg.content {
+                    MessageContent::String(s) => {
+                        let cleaned = CavemanCleaner::clean(s);
+                        if cleaned != *s {
+                            *s = cleaned;
+                            modified = true;
+                        }
+                    }
+                    MessageContent::Array(blocks) => {
+                        for block in blocks {
+                            if let ContentBlock::Text { text } = block {
+                                let cleaned = CavemanCleaner::clean(text);
+                                if cleaned != *text {
+                                    *text = cleaned;
+                                    modified = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        modified
+    }
+
+    /// Clean tool result messages using RtkCleaner
+    pub fn clean_tool_message(msg: &mut Message) -> bool {
+        let mut modified = false;
+        if let MessageContent::Array(blocks) = &mut msg.content {
+            for block in blocks {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    if let Some(s) = content.as_str() {
+                        let cleaned = RtkCleaner::clean(s, 48);
+                        if cleaned != s {
+                            *content = serde_json::Value::String(cleaned);
+                            modified = true;
+                        }
+                    }
+                }
+            }
+        }
+        modified
+    }
+
+    /// Clean OpenAI tool message using RtkCleaner
+    pub fn clean_openai_tool_message(msg: &mut OpenAIMessage) -> bool {
+        if msg.role == "tool" {
+            if let Some(ref mut content) = msg.content {
+                match content {
+                    crate::proxy::mappers::openai::models::OpenAIContent::String(s) => {
+                        let cleaned = RtkCleaner::clean(s, 48);
+                        if cleaned != *s {
+                            *s = cleaned;
+                            return true;
+                        }
+                    }
+                    crate::proxy::mappers::openai::models::OpenAIContent::Array(blocks) => {
+                        let mut modified = false;
+                        for block in blocks {
+                            if let crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text } = block {
+                                let cleaned = RtkCleaner::clean(text, 48);
+                                if cleaned != *text {
+                                    *text = cleaned;
+                                    modified = true;
+                                }
+                            }
+                        }
+                        return modified;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Internal helper to strip thinking blocks from messages outside the protected range
@@ -68,7 +253,7 @@ impl ContextManager {
         if total_msgs == 0 {
             return false;
         }
-        
+
         let start_protection_idx = total_msgs.saturating_sub(protected_last_n);
         let mut modified = false;
 
@@ -83,7 +268,7 @@ impl ContextManager {
                     let original_len = blocks.len();
                     // Retain only non-Thinking blocks
                     blocks.retain(|b| !matches!(b, ContentBlock::Thinking { .. }));
-                    
+
                     if blocks.len() != original_len {
                         modified = true;
                         debug!(
@@ -197,79 +382,6 @@ impl ContextManager {
         total
     }
 
-    // ===== [Layer 2] Thinking Content Compression + Signature Preservation =====
-    // Borrowed from learn-claude-code's "append-only log" principle
-    // This layer compresses thinking text but PRESERVES signatures
-    // Advantage: Signature chain remains intact, tool calls won't break
-    // Disadvantage: Still breaks Prompt Cache (modifies content)
-
-    /// Compress thinking content while preserving signatures
-    ///
-    /// This function:
-    /// 1. Keeps signatures intact (critical for tool call chain)
-    /// 2. Compresses thinking text to "..." placeholder
-    /// 3. Protects the last N messages from compression
-    ///
-    /// Returns true if any thinking blocks were compressed
-    pub fn compress_thinking_preserve_signature(
-        messages: &mut Vec<Message>,
-        protected_last_n: usize,
-    ) -> bool {
-        let total_msgs = messages.len();
-        if total_msgs == 0 {
-            return false;
-        }
-
-        let start_protection_idx = total_msgs.saturating_sub(protected_last_n);
-        let mut compressed_count = 0;
-        let mut total_chars_saved = 0;
-
-        for (i, msg) in messages.iter_mut().enumerate() {
-            // Skip protected messages
-            if i >= start_protection_idx {
-                continue;
-            }
-
-            // Only process assistant messages
-            if msg.role == "assistant" {
-                if let MessageContent::Array(blocks) = &mut msg.content {
-                    for block in blocks.iter_mut() {
-                        if let ContentBlock::Thinking {
-                            thinking,
-                            signature,
-                            ..
-                        } = block
-                        {
-                            // Key logic: Only compress if signature exists
-                            // This ensures we don't lose unsigned thinking blocks
-                            if signature.is_some() && thinking.len() > 10 {
-                                let original_len = thinking.len();
-                                *thinking = "...".to_string();
-                                compressed_count += 1;
-                                total_chars_saved += original_len - 3;
-
-                                debug!(
-                                    "[ContextManager] [Layer-2] Compressed thinking: {} → 3 chars (signature preserved)",
-                                    original_len
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if compressed_count > 0 {
-            let estimated_tokens_saved = (total_chars_saved as f32 / 3.5).ceil() as u32;
-            info!(
-                "[ContextManager] [Layer-2] Compressed {} thinking blocks (saved ~{} tokens, signatures preserved)",
-                compressed_count, estimated_tokens_saved
-            );
-        }
-
-        compressed_count > 0
-    }
-
     // ===== [Layer 3 Helper] Extract Last Valid Signature =====
     // Used by Layer 3 to preserve signature when generating XML summary
 
@@ -308,135 +420,498 @@ impl ContextManager {
         None
     }
 
+    /// Extract last valid signature for OpenAI using SignatureCache
+    pub fn extract_last_openai_valid_signature(session_id: &str) -> Option<String> {
+        crate::proxy::signature_cache::SignatureCache::global().get_session_signature(session_id)
+    }
+
     // ===== [Layer 1] Tool Message Intelligent Trimming =====
     // Borrowed from Practical-Guide-to-Context-Engineering
     // This layer removes old tool call/result pairs while preserving recent ones
     // Advantage: Does NOT break Prompt Cache (only removes messages, doesn't modify content)
 
-    /// Trim old tool messages, keeping only the last N rounds
-    ///
-    /// A "tool round" consists of:
-    /// - An assistant message with tool_use
-    /// - One or more user messages with tool_result
-    ///
-    /// Returns true if any messages were removed
-    pub fn trim_tool_messages(messages: &mut Vec<Message>, keep_last_n_rounds: usize) -> bool {
-        let tool_rounds = identify_tool_rounds(messages);
-
-        if tool_rounds.len() <= keep_last_n_rounds {
-            return false; // No trimming needed
-        }
-
-        // Identify indices to remove (older rounds)
-        let rounds_to_remove = tool_rounds.len() - keep_last_n_rounds;
-        let mut indices_to_remove = std::collections::HashSet::new();
-
-        for round in tool_rounds.iter().take(rounds_to_remove) {
-            for idx in &round.indices {
-                indices_to_remove.insert(*idx);
+    /// 折叠工具回执里的日志噪音。不删除任何工具调用轮次；留哪些调用由客户端决定。
+    pub fn trim_tool_messages(messages: &mut Vec<Message>) -> bool {
+        let mut modified = false;
+        for msg in messages.iter_mut() {
+            if Self::clean_tool_message(msg) {
+                modified = true;
             }
         }
-
-        // Remove in reverse order to avoid index shifting
-        let mut removed_count = 0;
-        for idx in (0..messages.len()).rev() {
-            if indices_to_remove.contains(&idx) {
-                messages.remove(idx);
-                removed_count += 1;
-            }
-        }
-
-        if removed_count > 0 {
-            info!(
-                "[ContextManager] [Layer-1] Trimmed {} tool messages, kept last {} rounds",
-                removed_count, keep_last_n_rounds
-            );
-        }
-
-        removed_count > 0
+        modified
     }
-}
 
-/// Represents a tool call round (assistant tool_use + user tool_result(s))
-#[derive(Debug)]
-struct ToolRound {
-    _assistant_index: usize,
-    tool_result_indices: Vec<usize>,
-    indices: Vec<usize>, // All indices in this round
-}
+    /// Restore reasoning text for assistant messages from cache in OpenAI format
+    pub fn restore_openai_reasoning_content(messages: &mut Vec<OpenAIMessage>, session_id: &str) {
+        let mut assistant_turn_count = 0;
+        for msg in messages.iter_mut() {
+            if msg.role == "assistant" {
+                let is_missing = msg
+                    .reasoning_content
+                    .as_ref()
+                    .map(|s| s.is_empty() || s == "[undefined]")
+                    .unwrap_or(true);
 
-/// Identify tool call rounds in the message history
-fn identify_tool_rounds(messages: &[Message]) -> Vec<ToolRound> {
-    let mut rounds = Vec::new();
-    let mut current_round: Option<ToolRound> = None;
-
-    for (i, msg) in messages.iter().enumerate() {
-        match msg.role.as_str() {
-            "assistant" => {
-                if has_tool_use(&msg.content) {
-                    // Save previous round if exists
-                    if let Some(round) = current_round.take() {
-                        rounds.push(round);
-                    }
-                    // Start new round
-                    current_round = Some(ToolRound {
-                        _assistant_index: i,
-                        tool_result_indices: Vec::new(),
-                        indices: vec![i],
-                    });
-                }
-            }
-            "user" => {
-                if let Some(ref mut round) = current_round {
-                    if has_tool_result(&msg.content) {
-                        round.tool_result_indices.push(i);
-                        round.indices.push(i);
-                    } else {
-                        // Normal user message ends the current round
-                        rounds.push(current_round.take().unwrap());
+                if is_missing {
+                    if let Some(cached_reasoning) = crate::proxy::SignatureCache::global()
+                        .get_session_reasoning(session_id, assistant_turn_count)
+                    {
+                        tracing::debug!(
+                            "[OpenAI-Reasoning] Restored reasoning for assistant turn {} (len: {})",
+                            assistant_turn_count,
+                            cached_reasoning.len()
+                        );
+                        msg.reasoning_content = Some(cached_reasoning);
                     }
                 }
+                assistant_turn_count += 1;
             }
-            _ => {}
         }
     }
 
-    // Save last round if exists
-    if let Some(round) = current_round {
-        rounds.push(round);
+    /// Purify reasoning text in OpenAI history to save tokens
+    pub fn purify_openai_history(
+        messages: &mut Vec<OpenAIMessage>,
+        strategy: PurificationStrategy,
+    ) -> bool {
+        let protected_last_n = match strategy {
+            PurificationStrategy::Soft => 4, // Keep thinking for recent 4 messages (approx 2 turns)
+            PurificationStrategy::Aggressive => 0,
+        };
+        let total_msgs = messages.len();
+        if total_msgs == 0 {
+            return false;
+        }
+        let start_protection_idx = total_msgs.saturating_sub(protected_last_n);
+        let mut modified = false;
+
+        for (i, msg) in messages.iter_mut().enumerate() {
+            if i >= start_protection_idx {
+                continue;
+            }
+            if msg.role == "assistant" && msg.reasoning_content.is_some() {
+                let has_tool_calls = msg
+                    .tool_calls
+                    .as_ref()
+                    .map(|tc| !tc.is_empty())
+                    .unwrap_or(false);
+                if !has_tool_calls {
+                    tracing::debug!(
+                        "[ContextManager] Purifying reasoning_content of message {} (len: {})",
+                        i,
+                        msg.reasoning_content.as_ref().unwrap().len()
+                    );
+                    msg.reasoning_content = None;
+                    modified = true;
+                }
+                // [REMOVED 2026-09-27] 带 tool_calls 的 reasoning 不再压缩为 "..."，保持原样透传。
+            }
+            if msg.role == "user" || msg.role == "assistant" {
+                if let Some(ref mut content) = msg.content {
+                    match content {
+                        crate::proxy::mappers::openai::models::OpenAIContent::String(s) => {
+                            let cleaned = CavemanCleaner::clean(s);
+                            if cleaned != *s {
+                                *s = cleaned;
+                                modified = true;
+                            }
+                        }
+                        crate::proxy::mappers::openai::models::OpenAIContent::Array(blocks) => {
+                            for block in blocks {
+                                if let crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text } = block {
+                                    let cleaned = CavemanCleaner::clean(text);
+                                    if cleaned != *text {
+                                        *text = cleaned;
+                                        modified = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        modified
     }
 
-    debug!(
-        "[ContextManager] Identified {} tool rounds in {} messages",
-        rounds.len(),
-        messages.len()
-    );
-
-    rounds
-}
-
-/// Check if message content contains tool_use
-fn has_tool_use(content: &MessageContent) -> bool {
-    if let MessageContent::Array(blocks) = content {
-        blocks
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-    } else {
-        false
+    /// 折叠 OpenAI 工具回执里的日志噪音，并丢掉没有对应 tool_call 的回执。
+    /// 不按轮次删历史；留哪些工具调用由客户端决定。
+    pub fn trim_openai_tool_messages(messages: &mut Vec<OpenAIMessage>) -> bool {
+        let mut modified = false;
+        for msg in messages.iter_mut() {
+            if Self::clean_openai_tool_message(msg) {
+                modified = true;
+            }
+        }
+        modified || drop_unpaired_openai_tool_results(messages)
     }
 }
 
-/// Check if message content contains tool_result
-fn has_tool_result(content: &MessageContent) -> bool {
-    if let MessageContent::Array(blocks) = content {
-        blocks
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-    } else {
-        false
-    }
+fn is_openai_tool_result_message(msg: &OpenAIMessage) -> bool {
+    msg.role == "tool"
+        || msg.role == "function"
+        || (msg.tool_call_id.is_some() && msg.role != "assistant")
 }
 
+/// 删掉没有对应 `tool_calls.id` 的 tool 结果。无 id 的结果无法证明是孤儿，保留。
+fn drop_unpaired_openai_tool_results(messages: &mut Vec<OpenAIMessage>) -> bool {
+    let mut call_ids = std::collections::HashSet::new();
+    for msg in messages.iter() {
+        if let Some(calls) = &msg.tool_calls {
+            for call in calls {
+                if !call.id.is_empty() {
+                    call_ids.insert(call.id.clone());
+                }
+            }
+        }
+    }
+
+    let before = messages.len();
+    messages.retain(|msg| {
+        if !is_openai_tool_result_message(msg) {
+            return true;
+        }
+        match msg.tool_call_id.as_deref() {
+            Some(id) if !id.is_empty() => call_ids.contains(id),
+            _ => true,
+        }
+    });
+    let dropped = before - messages.len();
+    if dropped > 0 {
+        info!(
+            "[ContextManager] [OpenAI] Dropped {} orphan tool result(s)",
+            dropped
+        );
+    }
+    dropped > 0
+}
+
+/// 去掉 id 在现存 functionCall 中找不到的 functionResponse。无 id 的回执保留。
+pub fn drop_orphan_function_responses(contents: &mut Vec<Value>) -> usize {
+    let mut call_ids = std::collections::HashSet::new();
+    for content in contents.iter() {
+        if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+            for part in parts {
+                if let Some(id) = part
+                    .get("functionCall")
+                    .and_then(|fc| fc.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !id.is_empty() {
+                        call_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut dropped = 0usize;
+    let mut kept = Vec::with_capacity(contents.len());
+    for mut content in contents.drain(..) {
+        let empty = if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
+            let before = parts.len();
+            parts.retain(|part| {
+                let Some(fr) = part.get("functionResponse") else {
+                    return true;
+                };
+                match fr.get("id").and_then(|v| v.as_str()) {
+                    Some(id) if !id.is_empty() => call_ids.contains(id),
+                    _ => true,
+                }
+            });
+            dropped += before - parts.len();
+            parts.is_empty()
+        } else {
+            false
+        };
+        if !empty {
+            kept.push(content);
+        }
+    }
+    *contents = kept;
+    if dropped > 0 {
+        info!(
+            "[ContextManager] Dropped {} orphan function response(s)",
+            dropped
+        );
+    }
+    dropped
+}
+
+impl ContextManager {
+    /// Estimate token usage for an OpenAI Request
+    pub fn estimate_openai_token_usage(request: &OpenAIRequest) -> u32 {
+        let mut total = 0;
+
+        // System or developer messages, tools definitions, prompt
+        if let Some(prompt) = &request.prompt {
+            total += estimate_tokens_from_str(prompt);
+        }
+        if let Some(instructions) = &request.instructions {
+            total += estimate_tokens_from_str(instructions);
+        }
+
+        for msg in &request.messages {
+            total += 4; // msg overhead
+
+            if let Some(ref content) = msg.content {
+                match content {
+                    crate::proxy::mappers::openai::models::OpenAIContent::String(s) => {
+                        total += estimate_tokens_from_str(s);
+                    }
+                    crate::proxy::mappers::openai::models::OpenAIContent::Array(blocks) => {
+                        for block in blocks {
+                            match block {
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::Text { text } => {
+                                    total += estimate_tokens_from_str(text);
+                                }
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::ImageUrl { image_url } => {
+                                    // Gemini counts images at ~258 tokens for standard resolution.
+                                    // For base64 data URLs, estimate higher based on payload size
+                                    // since very large images can consume significantly more tokens.
+                                    total += estimate_image_tokens_from_url(&image_url.url);
+                                }
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::AudioUrl { audio_url } => {
+                                    // Audio is tokenized at ~32 tokens per second (~25 bytes/token from base64)
+                                    total += estimate_media_tokens_from_url(&audio_url.url);
+                                }
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::InputAudio { input_audio } => {
+                                    // input_audio 携带裸 base64，直接按 inlineData 估算
+                                    total += estimate_inline_data_tokens(
+                                        &input_audio.mime_type(),
+                                        input_audio.data.len(),
+                                    );
+                                }
+                                crate::proxy::mappers::openai::models::OpenAIContentBlock::VideoUrl { video_url } => {
+                                    // Video token estimation based on media payload size
+                                    total += estimate_media_tokens_from_url(&video_url.url);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(ref reasoning) = msg.reasoning_content {
+                total += estimate_tokens_from_str(reasoning);
+                total += 100; // signature/thinking overhead
+            }
+
+            if let Some(ref tool_calls) = msg.tool_calls {
+                for tc in tool_calls {
+                    total += 20;
+                    if let Some(ref func) = tc.function {
+                        total += estimate_tokens_from_str(&func.name);
+                        total += estimate_tokens_from_str(&func.arguments);
+                    }
+                }
+            }
+
+            if let Some(ref name) = msg.name {
+                total += estimate_tokens_from_str(name);
+            }
+        }
+
+        if let Some(tools) = &request.tools {
+            for tool in tools {
+                if let Ok(json_str) = serde_json::to_string(tool) {
+                    total += estimate_tokens_from_str(&json_str);
+                }
+            }
+        }
+
+        if let Some(thinking) = &request.thinking {
+            if let Some(budget) = thinking.budget_tokens {
+                total += budget;
+            }
+        }
+
+        total
+    }
+
+    /// Estimate token usage for a Gemini Request represented as serde_json::Value
+    pub fn estimate_gemini_token_usage(body: &Value) -> u32 {
+        let body = body.get("request").unwrap_or(body);
+        let mut total = 0;
+
+        // systemInstruction
+        if let Some(sys_inst) = body.get("systemInstruction") {
+            if let Some(parts) = sys_inst.get("parts").and_then(|p| p.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        total += estimate_tokens_from_str(text);
+                    }
+                }
+            }
+        }
+
+        // contents
+        if let Some(contents) = body.get("contents").and_then(|c| c.as_array()) {
+            for msg in contents {
+                total += 4; // msg overhead
+                if let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) {
+                    for part in parts {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            total += estimate_tokens_from_str(text);
+                        }
+                        if let Some(thought) = part.get("thought").and_then(|t| t.as_bool()) {
+                            if thought {
+                                total += 100; // thinking overhead
+                            }
+                        }
+                        // inlineData: base64-encoded images/audio embedded in the request
+                        if let Some(inline_data) = part.get("inlineData") {
+                            let mime = inline_data
+                                .get("mimeType")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("");
+                            let data_len = inline_data
+                                .get("data")
+                                .and_then(|d| d.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                            total += estimate_inline_data_tokens(mime, data_len);
+                        }
+                        if let Some(fc) = part.get("functionCall") {
+                            total += 20;
+                            if let Some(name) = fc.get("name").and_then(|n| n.as_str()) {
+                                total += estimate_tokens_from_str(name);
+                            }
+                            if let Some(args) = fc.get("args") {
+                                if let Ok(json_str) = serde_json::to_string(args) {
+                                    total += estimate_tokens_from_str(&json_str);
+                                }
+                            }
+                        }
+                        if let Some(fr) = part.get("functionResponse") {
+                            total += 10;
+                            if let Some(name) = fr.get("name").and_then(|n| n.as_str()) {
+                                total += estimate_tokens_from_str(name);
+                            }
+                            if let Some(resp) = fr.get("response") {
+                                if let Ok(json_str) = serde_json::to_string(resp) {
+                                    total += estimate_tokens_from_str(&json_str);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // tools
+        if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+            for tool in tools {
+                if let Ok(json_str) = serde_json::to_string(tool) {
+                    total += estimate_tokens_from_str(&json_str);
+                }
+            }
+        }
+
+        total
+    }
+
+    /// 折叠 Gemini 工具回执里的日志噪音，并丢掉没有对应 functionCall 的回执。
+    /// 不按轮次删历史；留哪些工具调用由客户端决定。
+    pub fn trim_gemini_tool_messages(body: &mut Value) -> bool {
+        if let Some(contents) = body.get_mut("contents").and_then(|c| c.as_array_mut()) {
+            let mut cleaned = false;
+            for msg in contents.iter_mut() {
+                if let Some(parts) = msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                    for part in parts {
+                        if let Some(fr) = part.get_mut("functionResponse") {
+                            if let Some(resp_obj) =
+                                fr.get_mut("response").and_then(|r| r.as_object_mut())
+                            {
+                                for (_key, val) in resp_obj.iter_mut() {
+                                    if let Some(s) = val.as_str() {
+                                        let next = RtkCleaner::clean(s, 48);
+                                        if next != s {
+                                            *val = json!(next);
+                                            cleaned = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cleaned || drop_orphan_function_responses(contents) > 0
+        } else {
+            false
+        }
+    }
+
+    /// Compress thinking in Gemini request body, keeping it in a lightweight representation
+    pub fn compress_gemini_thinking_preserve_signature(
+        body: &mut Value,
+        protected_last_n: usize,
+    ) -> bool {
+        let contents = if body.get("contents").and_then(|c| c.as_array()).is_some() {
+            body.get_mut("contents").and_then(|c| c.as_array_mut())
+        } else {
+            body.get_mut("request")
+                .and_then(|r| r.get_mut("contents"))
+                .and_then(|c| c.as_array_mut())
+        };
+        if let Some(contents) = contents {
+            let total_turns = contents.len();
+            if total_turns == 0 {
+                return false;
+            }
+
+            let start_protection_idx = total_turns.saturating_sub(protected_last_n);
+            let mut compressed_count = 0;
+
+            for (i, msg) in contents.iter_mut().enumerate() {
+                if i >= start_protection_idx {
+                    continue;
+                }
+
+                let role = msg
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("unknown");
+                if role == "model" {
+                    if let Some(parts) = msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                        for part in parts {
+                            if let Some(obj) = part.as_object_mut() {
+                                if let Some(thought) = obj.get("thought").and_then(|t| t.as_bool())
+                                {
+                                    if thought {
+                                        if let Some(text) =
+                                            obj.get_mut("text").and_then(|t| t.as_str())
+                                        {
+                                            if text.len() > 10 {
+                                                obj.insert("text".to_string(), json!("..."));
+                                                // [FIX] Remove thoughtSignature when compressing thought text
+                                                // Signature is computed over original thought content; keeping it with "..." causes
+                                                // Google API to return 400 INVALID_ARGUMENT: Invalid thought signature.
+                                                obj.remove("thoughtSignature");
+                                                compressed_count += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            compressed_count > 0
+        } else {
+            false
+        }
+    }
+
+    /// Re-estimate (and optionally compress) AFTER mapping + thinking restore on the transit body.
+    pub fn apply_post_transit_context_mgmt(body: &mut Value, mapped_model: &str) -> u32 {
+        let _ = mapped_model;
+        // 不改写客户端正文、思考或工具回执。用量只用于观测。
+        Self::estimate_gemini_token_usage(body)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +933,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         }
     }
 
@@ -572,5 +1048,107 @@ mod tests {
             assert_eq!(blocks.len(), 1);
             assert!(matches!(blocks[0], ContentBlock::Text { .. }));
         }
+    }
+
+    fn openai_call(id: &str) -> OpenAIMessage {
+        use crate::proxy::mappers::openai::models::{ToolCall, ToolFunction};
+        OpenAIMessage {
+            role: "assistant".into(),
+            tool_calls: Some(vec![ToolCall {
+                id: id.into(),
+                r#type: "function".into(),
+                function: Some(ToolFunction {
+                    name: "tool".into(),
+                    arguments: "{}".into(),
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn openai_tool(id: &str) -> OpenAIMessage {
+        use crate::proxy::mappers::openai::models::OpenAIContent;
+        OpenAIMessage {
+            role: "tool".into(),
+            tool_call_id: Some(id.into()),
+            content: Some(OpenAIContent::String("ok".into())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parallel_openai_calls_are_not_trimmed() {
+        let mut messages = Vec::new();
+        for n in 0..2 {
+            messages.push(openai_call(&format!("a{n}")));
+            messages.push(openai_call(&format!("b{n}")));
+            messages.push(openai_tool(&format!("a{n}")));
+            messages.push(openai_tool(&format!("b{n}")));
+        }
+        let _ = ContextManager::trim_openai_tool_messages(&mut messages);
+        let call_ids: Vec<_> = messages
+            .iter()
+            .filter_map(|msg| msg.tool_calls.as_ref())
+            .flatten()
+            .map(|call| call.id.as_str())
+            .collect();
+        let result_ids: Vec<_> = messages
+            .iter()
+            .filter_map(|msg| msg.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(call_ids, vec!["a0", "b0", "a1", "b1"]);
+        assert_eq!(result_ids, vec!["a0", "b0", "a1", "b1"]);
+    }
+
+    #[test]
+    fn gemini_parallel_calls_are_not_trimmed() {
+        let fc = |id: &str| json!({"functionCall": {"id": id, "name": "tool", "args": {}}});
+        let fr = |id: &str| json!({"functionResponse": {"id": id, "name": "tool", "response": {"result": "ok"}}});
+        let mut body = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "go"}]},
+                {"role": "model", "parts": [fc("a0")]},
+                {"role": "model", "parts": [fc("b0")]},
+                {"role": "user", "parts": [fr("a0")]},
+                {"role": "user", "parts": [fr("b0")]},
+                {"role": "model", "parts": [fc("a1")]},
+                {"role": "model", "parts": [fc("b1")]},
+                {"role": "user", "parts": [fr("a1")]},
+                {"role": "user", "parts": [fr("b1")]},
+            ]
+        });
+        let _ = ContextManager::trim_gemini_tool_messages(&mut body);
+        let contents = body["contents"].as_array().unwrap();
+        let mut call_ids = Vec::new();
+        let mut response_ids = Vec::new();
+        for content in contents {
+            for part in content["parts"].as_array().unwrap() {
+                if let Some(id) = part["functionCall"]["id"].as_str() {
+                    call_ids.push(id.to_string());
+                }
+                if let Some(id) = part["functionResponse"]["id"].as_str() {
+                    response_ids.push(id.to_string());
+                }
+            }
+        }
+        assert_eq!(
+            call_ids,
+            vec![
+                "a0".to_string(),
+                "b0".to_string(),
+                "a1".to_string(),
+                "b1".to_string()
+            ]
+        );
+        assert_eq!(
+            response_ids,
+            vec![
+                "a0".to_string(),
+                "b0".to_string(),
+                "a1".to_string(),
+                "b1".to_string()
+            ]
+        );
     }
 }

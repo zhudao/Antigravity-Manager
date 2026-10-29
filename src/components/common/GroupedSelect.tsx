@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronDown, Check } from 'lucide-react';
+import { ChevronDown, Check, Edit3 } from 'lucide-react';
 import { cn } from '../../utils/cn';
+import { getGroupPriority } from '../../config/modelConfig';
 
 export interface SelectOption {
     value: string;
@@ -16,6 +17,7 @@ interface GroupedSelectProps {
     placeholder?: string;
     className?: string;
     disabled?: boolean;
+    allowCustomInput?: boolean; // 新增: 是否允许自定义输入
 }
 
 export default function GroupedSelect({
@@ -24,13 +26,29 @@ export default function GroupedSelect({
     options,
     placeholder = 'Select...',
     className = '',
-    disabled = false
+    disabled = false,
+    allowCustomInput = false // 新增: 默认不允许自定义输入
 }: GroupedSelectProps) {
     const [isOpen, setIsOpen] = useState(false);
-    const [dropdownPosition, setDropdownPosition] = useState({ top: 0, left: 0, width: 0 });
+    const [dropdownPosition, setDropdownPosition] = useState<{
+        top?: number;
+        bottom?: number;
+        left: number;
+        width: number;
+        maxHeight: number;
+        placement: 'top' | 'bottom';
+    }>({
+        top: 0,
+        left: 0,
+        width: 0,
+        maxHeight: 320,
+        placement: 'bottom'
+    });
+    const [customInput, setCustomInput] = useState(''); // 新增: 自定义输入值
     const containerRef = useRef<HTMLDivElement>(null);
     const buttonRef = useRef<HTMLButtonElement>(null);
     const dropdownRef = useRef<HTMLDivElement>(null); // 新增: 下拉菜单引用
+    const customInputRef = useRef<HTMLInputElement>(null); // 新增: 自定义输入框引用
 
     // 按组分组选项
     const groupedOptions = options.reduce((acc, option) => {
@@ -42,19 +60,59 @@ export default function GroupedSelect({
         return acc;
     }, {} as Record<string, SelectOption[]>);
 
+    // 按权威优先级对组进行动态排序 (Gemini 高版本优先，再到 Claude，再到 OpenAI/Other)
+    const sortedGroupEntries = Object.entries(groupedOptions).sort(([grpA], [grpB]) => {
+        const prioA = getGroupPriority(grpA);
+        const prioB = getGroupPriority(grpB);
+        if (prioA !== prioB) return prioA - prioB;
+        return grpA.localeCompare(grpB);
+    });
+
     // 获取当前选中项的标签
     const selectedOption = options.find(opt => opt.value === value);
-    const selectedLabel = selectedOption?.label || placeholder;
+    const selectedLabel = selectedOption?.label || value || placeholder;
 
-    // 更新下拉菜单位置
+    // 更新下拉菜单位置（智能检测视口边界，支持向上/向下翻转与最大高度自适应）
     const updateDropdownPosition = () => {
         if (buttonRef.current) {
             const rect = buttonRef.current.getBoundingClientRect();
-            setDropdownPosition({
-                top: rect.bottom + window.scrollY + 4,
-                left: rect.left + window.scrollX,
-                width: Math.max(rect.width * 1.1, 220) // 增加宽度到 1.1 倍,最小 220px
-            });
+            const viewportHeight = window.innerHeight;
+            const viewportWidth = window.innerWidth;
+            const spaceBelow = viewportHeight - rect.bottom;
+            const spaceAbove = rect.top;
+            const defaultMaxHeight = 320; // 对应原本 max-h-80
+
+            // 智能翻转判定：当下方剩余空间不足 260px 且上方空间明显更多时，向上翻转展开
+            const shouldFlipUp = spaceBelow < 260 && spaceAbove > spaceBelow;
+
+            const width = Math.max(rect.width * 1.1, 220);
+            // 水平视口边界保护：防止右侧溢出
+            let left = rect.left;
+            if (left + width > viewportWidth - 12) {
+                left = Math.max(8, viewportWidth - width - 12);
+            }
+
+            if (shouldFlipUp) {
+                // 向上翻转：距离视口顶部保留安全距离
+                const maxHeight = Math.min(defaultMaxHeight, Math.max(120, spaceAbove - 16));
+                setDropdownPosition({
+                    bottom: viewportHeight - rect.top + 4,
+                    left,
+                    width,
+                    maxHeight,
+                    placement: 'top'
+                });
+            } else {
+                // 默认向下展开：距离视口底部保留安全距离
+                const maxHeight = Math.min(defaultMaxHeight, Math.max(120, spaceBelow - 16));
+                setDropdownPosition({
+                    top: rect.bottom + 4,
+                    left,
+                    width,
+                    maxHeight,
+                    placement: 'bottom'
+                });
+            }
         }
     };
 
@@ -89,6 +147,15 @@ export default function GroupedSelect({
         console.log('[GroupedSelect] handleSelect called:', optionValue);
         onChange(optionValue);
         setIsOpen(false);
+    };
+
+    const handleCustomInputSubmit = () => {
+        if (customInput.trim()) {
+            console.log('[GroupedSelect] Custom input submitted:', customInput.trim());
+            onChange(customInput.trim());
+            setCustomInput('');
+            setIsOpen(false);
+        }
     };
 
     const handleToggle = () => {
@@ -133,26 +200,28 @@ export default function GroupedSelect({
                 />
             </button>
 
-            {/* 下拉菜单 - 使用 Portal 渲染到 body */}
+            {/* 下拉菜单 - 使用 Portal 渲染到 body (fixed 视口定位与动态高度，彻底解决视口溢出被切断问题) */}
             {isOpen && createPortal(
                 <div
                     ref={dropdownRef}
                     style={{
-                        position: 'absolute',
-                        top: `${dropdownPosition.top}px`,
+                        position: 'fixed',
+                        top: dropdownPosition.placement === 'bottom' ? `${dropdownPosition.top}px` : undefined,
+                        bottom: dropdownPosition.placement === 'top' ? `${dropdownPosition.bottom}px` : undefined,
                         left: `${dropdownPosition.left}px`,
                         width: `${dropdownPosition.width}px`,
+                        maxHeight: `${dropdownPosition.maxHeight}px`,
                         zIndex: 9999
                     }}
                     className={cn(
                         'bg-white dark:bg-gray-800',
                         'border border-gray-200 dark:border-gray-700',
                         'rounded-lg shadow-2xl',
-                        'max-h-80 overflow-y-auto',
+                        'overflow-y-auto',
                         'animate-in fade-in-0 zoom-in-95 duration-100'
                     )}
                 >
-                    {Object.entries(groupedOptions).map(([group, groupOptions]) => (
+                    {sortedGroupEntries.map(([group, groupOptions]) => (
                         <div key={group}>
                             {/* 分组标题 */}
                             <div className="px-3 py-1.5 text-[9px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider bg-gray-50 dark:bg-gray-900/50 sticky top-0 z-10">
@@ -184,6 +253,50 @@ export default function GroupedSelect({
                             ))}
                         </div>
                     ))}
+
+                    {/* 自定义输入区域 */}
+                    {allowCustomInput && (
+                        <div className="border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/50 p-2">
+                            <div className="flex items-center gap-1.5">
+                                <Edit3 size={12} className="text-gray-400 dark:text-gray-500 flex-shrink-0" />
+                                <input
+                                    ref={customInputRef}
+                                    type="text"
+                                    value={customInput}
+                                    onChange={(e) => setCustomInput(e.target.value)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                            e.preventDefault();
+                                            handleCustomInputSubmit();
+                                        }
+                                    }}
+                                    placeholder="输入自定义模型 ID..."
+                                    className={cn(
+                                        'flex-1 px-2 py-1 text-[10px] font-mono',
+                                        'bg-white dark:bg-gray-800',
+                                        'border border-gray-300 dark:border-gray-600',
+                                        'rounded focus:outline-none focus:ring-1 focus:ring-blue-500',
+                                        'text-gray-900 dark:text-gray-100',
+                                        'placeholder:text-gray-400 dark:placeholder:text-gray-500'
+                                    )}
+                                />
+                                <button
+                                    type="button"
+                                    onClick={handleCustomInputSubmit}
+                                    disabled={!customInput.trim()}
+                                    className={cn(
+                                        'px-2 py-1 text-[10px] font-medium rounded',
+                                        'transition-colors duration-150',
+                                        customInput.trim()
+                                            ? 'bg-blue-500 hover:bg-blue-600 text-white'
+                                            : 'bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed'
+                                    )}
+                                >
+                                    确定
+                                </button>
+                            </div>
+                        </div>
+                    )}
                 </div>,
                 document.body
             )}

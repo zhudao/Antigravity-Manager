@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { Plus, Database, Globe, FileClock, Loader2, CheckCircle2, XCircle, Copy, Check, Info, Link2 } from 'lucide-react';
+import { Plus, Database, Globe, Loader2, CheckCircle2, XCircle, Copy, Check, Info, Link2 } from 'lucide-react';
 import { useAccountStore } from '../../stores/useAccountStore';
 import { useTranslation } from 'react-i18next';
 import { listen } from '@tauri-apps/api/event';
@@ -11,11 +11,12 @@ import { copyToClipboard } from '../../utils/clipboard';
 
 interface AddAccountDialogProps {
     onAdd: (email: string, refreshToken: string) => Promise<void>;
+    showText?: boolean;
 }
 
 type Status = 'idle' | 'loading' | 'success' | 'error';
 
-function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
+function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
     const { t } = useTranslation();
     const fetchAccounts = useAccountStore(state => state.fetchAccounts);
     const [isOpen, setIsOpen] = useState(false);
@@ -29,7 +30,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
     const [status, setStatus] = useState<Status>('idle');
     const [message, setMessage] = useState('');
 
-    const { startOAuthLogin, completeOAuthLogin, cancelOAuthLogin, importFromDb, importV1Accounts, importFromCustomDb } = useAccountStore();
+    const { startOAuthLogin, completeOAuthLogin, cancelOAuthLogin, importFromDb, importFromCustomDb } = useAccountStore();
 
     const oauthUrlRef = useRef(oauthUrl);
     const statusRef = useRef(status);
@@ -283,7 +284,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
             const url = typeof res === 'string' ? res : res.url;
 
             if (!url) {
-                throw new Error('Could not obtain OAuth URL');
+                throw new Error(t('accounts.add.oauth.error_no_url', 'OAuth URLを取得できませんでした'));
             }
 
             setOauthUrl(url); // 确保链接在 UI 中可见，方便用户手动复制
@@ -293,13 +294,16 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
 
             if (!popup) {
                 setStatus('error');
-                setMessage(t('common.error') + ': Popup blocked');
+                setMessage(t('accounts.add.oauth.popup_blocked', 'ポップアップがブロックされました'));
                 return;
             }
 
             // 3. 监听消息
             const handleMessage = async (event: MessageEvent) => {
-                // 安全检查: 如果定义了 ORIGIN 校验更好，这里暂时检查 data type
+                // 安全检查: 严格校验消息来源为当前同源 origin
+                if (event.origin && event.origin !== window.location.origin) {
+                    return;
+                }
                 if (event.data?.type === 'oauth-success') {
                     popup.close();
                     window.removeEventListener('message', handleMessage);
@@ -366,29 +370,46 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
     const handleManualSubmit = async () => {
         if (!manualCode.trim()) return;
 
+        setStatus('loading');
+        setMessage(t('accounts.add.oauth.manual_submitting', '認可コードを送信中...'));
+
         try {
             await invoke('submit_oauth_code', { code: manualCode.trim(), state: null });
-            // The existing flow (startOAuthLogin) will pick this up and complete.
+
+            // 提交成功反馈
+            setStatus('success');
+            setMessage(t('accounts.add.oauth.manual_submitted', '認可コードを送信しました。バックエンドで処理中です...'));
+
             setManualCode('');
+
+            // 对齐 Web 模式下的刷新逻辑
+            if (!isTauri()) {
+                setTimeout(async () => {
+                    await fetchAccounts();
+                    setIsOpen(false);
+                    resetState();
+                }, 2000);
+            }
         } catch (error) {
             let errStr = String(error);
-            // If no flow is active, we might want to try starting one and then submitting, 
-            // but for now let's just show error.
             if (errStr.includes("No active OAuth flow")) {
                 setMessage(t('accounts.add.oauth.error_no_flow'));
                 setStatus('error');
             } else {
                 setMessage(`${t('common.error')}: ${errStr}`);
+                setStatus('error');
             }
         }
     };
 
     const handleImportDb = () => {
-        handleAction(t('accounts.add.tabs.import'), importFromDb);
-    };
-
-    const handleImportV1 = () => {
-        handleAction(t('accounts.add.import.btn_v1'), importV1Accounts);
+        handleAction(t('accounts.add.import.btn_db'), async () => {
+            const accounts = await importFromDb();
+            if (Array.isArray(accounts) && accounts.length > 0) {
+                setMessage(t('accounts.add.token.batch_success', { count: accounts.length }));
+            }
+            return accounts;
+        });
     };
 
     const handleImportCustomDb = async () => {
@@ -443,14 +464,15 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
     return (
         <>
             <button
-                className="px-4 py-2 bg-white dark:bg-base-100 text-gray-700 dark:text-gray-300 text-sm font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-2 shadow-sm border border-gray-200/50 dark:border-base-300 relative z-[100]"
+                className="px-2.5 lg:px-4 py-2 bg-white dark:bg-base-100 text-gray-700 dark:text-gray-300 text-sm font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-2 shadow-sm border border-gray-200/50 dark:border-base-300 relative z-[100]"
                 onClick={() => {
                     console.log('AddAccountDialog button clicked');
                     setIsOpen(true);
                 }}
+                title={!showText ? t('accounts.add_account') : undefined}
             >
                 <Plus className="w-4 h-4" />
-                {t('accounts.add_account')}
+                {showText && <span className="hidden lg:inline">{t('accounts.add_account')}</span>}
             </button>
 
             {isOpen && createPortal(
@@ -622,13 +644,13 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
 
                             {/* 从数据库导入 */}
                             {activeTab === 'import' && (
-                                <div className="space-y-6 py-2">
+                                <div className="space-y-4 py-2">
                                     <div className="space-y-2">
                                         <h4 className="font-semibold flex items-center gap-2 text-gray-800 dark:text-gray-200">
-                                            <Database className="w-4 h-4 text-gray-600 dark:text-gray-400" />
+                                            <Database className="w-4 h-4 text-blue-600 dark:text-blue-400" />
                                             {t('accounts.add.import.scheme_a')}
                                         </h4>
-                                        <p className="text-xs text-gray-500 dark:text-gray-400">
+                                        <p className="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
                                             {t('accounts.add.import.scheme_a_desc')}
                                         </p>
                                         <button
@@ -636,7 +658,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
                                             onClick={handleImportDb}
                                             disabled={status === 'loading' || status === 'success'}
                                         >
-                                            <CheckCircle2 className="w-4 h-4 opacity-0 group-hover:opacity-100 transition-opacity" />
+                                            <CheckCircle2 className="w-4 h-4 text-blue-500 opacity-80" />
                                             {t('accounts.add.import.btn_db')}
                                         </button>
                                         <button
@@ -644,28 +666,8 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
                                             onClick={handleImportCustomDb}
                                             disabled={status === 'loading' || status === 'success'}
                                         >
-                                            <Database className="w-4 h-4" />
+                                            <Database className="w-4 h-4 opacity-70" />
                                             {t('accounts.add.import.btn_custom_db') || 'Custom DB (state.vscdb)'}
-                                        </button>
-                                    </div>
-
-                                    <div className="divider text-xs text-gray-300 dark:text-gray-600">{t('accounts.add.import.or')}</div>
-
-                                    <div className="space-y-2">
-                                        <h4 className="font-semibold flex items-center gap-2 text-gray-800 dark:text-gray-200">
-                                            <FileClock className="w-4 h-4 text-gray-600 dark:text-gray-400" />
-                                            {t('accounts.add.import.scheme_b')}
-                                        </h4>
-                                        <p className="text-xs text-gray-500 dark:text-gray-400">
-                                            {t('accounts.add.import.scheme_b_desc')}
-                                        </p>
-                                        <button
-                                            className="w-full px-4 py-3 bg-gray-50 dark:bg-base-200 text-gray-700 dark:text-gray-300 font-medium rounded-xl border border-gray-200 dark:border-base-300 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 hover:border-emerald-200 dark:hover:border-emerald-800 hover:text-emerald-600 dark:hover:text-emerald-400 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
-                                            onClick={handleImportV1}
-                                            disabled={status === 'loading' || status === 'success'}
-                                        >
-                                            <FileClock className="w-4 h-4" />
-                                            {t('accounts.add.import.btn_v1')}
                                         </button>
                                     </div>
                                 </div>

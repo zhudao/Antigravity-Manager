@@ -5,161 +5,20 @@ use super::models::*;
 use super::utils::to_claude_usage;
 use crate::proxy::mappers::estimation_calibrator::get_calibrator;
 // use crate::proxy::mappers::signature_store::store_thought_signature; // Deprecated
+use crate::proxy::common::client_adapter::{ClientAdapter, SignatureBufferStrategy}; // [NEW]
 use crate::proxy::SignatureCache;
 use bytes::Bytes;
 use serde_json::{json, Value};
 
-/// Known parameter remappings for Gemini → Claude compatibility
-/// [FIX] Gemini sometimes uses different parameter names than specified in tool schema
+/// Passthrough tool arguments for Gemini → Claude compatibility
 pub fn remap_function_call_args(name: &str, args: &mut Value) {
-    // [DEBUG] Always log incoming tool usage for diagnosis
+    // 纯透传协议工具参数，不进行任何字段重命名与拦截改写
     if let Some(obj) = args.as_object() {
-        tracing::debug!("[Streaming] Tool Call: '{}' Args: {:?}", name, obj);
-    }
-
-    // [IMPORTANT] Claude Code CLI 的 EnterPlanMode 工具禁止携带任何参数
-    // 代理层注入的 reason 参数会导致 InputValidationError
-    if name == "EnterPlanMode" {
-        if let Some(obj) = args.as_object_mut() {
-            obj.clear();
-        }
-        return;
-    }
-
-    if let Some(obj) = args.as_object_mut() {
-        // [IMPROVED] Case-insensitive matching for tool names
-        match name.to_lowercase().as_str() {
-            "grep" | "search" | "search_code_definitions" | "search_code_snippets" => {
-                // [FIX] Gemini hallucination: maps parameter description to "description" field
-                if let Some(desc) = obj.remove("description") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), desc);
-                        tracing::debug!("[Streaming] Remapped Grep: description → pattern");
-                    }
-                }
-
-                // Gemini uses "query", Claude Code expects "pattern"
-                if let Some(query) = obj.remove("query") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), query);
-                        tracing::debug!("[Streaming] Remapped Grep: query → pattern");
-                    }
-                }
-
-                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.remove("paths") {
-                        let path_str = if let Some(arr) = paths.as_array() {
-                            arr.get(0)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".")
-                                .to_string()
-                        } else if let Some(s) = paths.as_str() {
-                            s.to_string()
-                        } else {
-                            ".".to_string()
-                        };
-                        obj.insert("path".to_string(), serde_json::json!(path_str));
-                        tracing::debug!(
-                            "[Streaming] Remapped Grep: paths → path(\"{}\")",
-                            path_str
-                        );
-                    } else {
-                        // Default to current directory if missing
-                        obj.insert("path".to_string(), json!("."));
-                        tracing::debug!("[Streaming] Added default path: \".\"");
-                    }
-                }
-
-                // Note: We keep "-n" and "output_mode" if present as they are valid in Grep schema
-            }
-            "glob" => {
-                // [FIX] Gemini hallucination: maps parameter description to "description" field
-                if let Some(desc) = obj.remove("description") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), desc);
-                        tracing::debug!("[Streaming] Remapped Glob: description → pattern");
-                    }
-                }
-
-                // Gemini uses "query", Claude Code expects "pattern"
-                if let Some(query) = obj.remove("query") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), query);
-                        tracing::debug!("[Streaming] Remapped Glob: query → pattern");
-                    }
-                }
-
-                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.remove("paths") {
-                        let path_str = if let Some(arr) = paths.as_array() {
-                            arr.get(0)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".")
-                                .to_string()
-                        } else if let Some(s) = paths.as_str() {
-                            s.to_string()
-                        } else {
-                            ".".to_string()
-                        };
-                        obj.insert("path".to_string(), serde_json::json!(path_str));
-                        tracing::debug!(
-                            "[Streaming] Remapped Glob: paths → path(\"{}\")",
-                            path_str
-                        );
-                    } else {
-                        // Default to current directory if missing
-                        obj.insert("path".to_string(), json!("."));
-                        tracing::debug!("[Streaming] Added default path: \".\"");
-                    }
-                }
-            }
-            "read" => {
-                // Gemini might use "path" vs "file_path"
-                if let Some(path) = obj.remove("path") {
-                    if !obj.contains_key("file_path") {
-                        obj.insert("file_path".to_string(), path);
-                        tracing::debug!("[Streaming] Remapped Read: path → file_path");
-                    }
-                }
-            }
-            "ls" => {
-                // LS tool: ensure "path" parameter exists
-                if !obj.contains_key("path") {
-                    obj.insert("path".to_string(), json!("."));
-                    tracing::debug!("[Streaming] Remapped LS: default path → \".\"");
-                }
-            }
-            other => {
-                // [NEW] [Issue #785] Generic Property Mapping for all tools
-                // If a tool has "paths" (array of 1) but no "path", convert it.
-                let mut path_to_inject = None;
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.get("paths").and_then(|v| v.as_array()) {
-                        if paths.len() == 1 {
-                            if let Some(p) = paths[0].as_str() {
-                                path_to_inject = Some(p.to_string());
-                            }
-                        }
-                    }
-                }
-
-                if let Some(path) = path_to_inject {
-                    obj.insert("path".to_string(), json!(path));
-                    tracing::debug!(
-                        "[Streaming] Probabilistic fix for tool '{}': paths[0] → path(\"{}\")",
-                        other,
-                        path
-                    );
-                }
-                tracing::debug!(
-                    "[Streaming] Unmapped tool call processed via generic rules: {} (keys: {:?})",
-                    other,
-                    obj.keys()
-                );
-            }
-        }
+        tracing::debug!(
+            "[Streaming] Tool Call (Passthrough): '{}' Args: {:?}",
+            name,
+            obj
+        );
     }
 }
 
@@ -230,6 +89,14 @@ pub struct StreamingState {
     pub has_thinking: bool,
     pub has_content: bool,
     pub message_count: usize, // [NEW v4.0.0] Message count for rewind detection
+    pub client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [FIX] Remove Box, use Arc<dyn> directly
+    // [FIX #MCP] Registered tool names for fuzzy matching
+    pub registered_tool_names: Vec<String>,
+    // [FIX #3379] Track whether any text_delta was emitted this turn (guard G7)
+    pub text_delta_emitted_this_turn: bool,
+    pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
+    /// 缓存流式过程中接收到的最近一次使用量元数据，防止单独下发 finishReason 或无元数据收尾时 Token 统计归零
+    pub last_usage: Option<UsageMetadata>,
 }
 
 impl StreamingState {
@@ -257,7 +124,22 @@ impl StreamingState {
             has_thinking: false,
             has_content: false,
             message_count: 0,
+            client_adapter: None,
+            registered_tool_names: Vec::new(),
+            text_delta_emitted_this_turn: false,
+            thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
+            last_usage: None,
         }
+    }
+
+    // [NEW] Set client adapter
+    pub fn set_client_adapter(&mut self, adapter: Option<std::sync::Arc<dyn ClientAdapter>>) {
+        self.client_adapter = adapter;
+    }
+
+    // [FIX #MCP] Set registered tool names for fuzzy matching
+    pub fn set_registered_tool_names(&mut self, names: Vec<String>) {
+        self.registered_tool_names = names;
     }
 
     /// 发送 SSE 事件
@@ -302,6 +184,11 @@ impl StreamingState {
 
         if let Some(u) = usage {
             message["usage"] = json!(u);
+        } else {
+            message["usage"] = json!({
+                "input_tokens": 0,
+                "output_tokens": 0
+            });
         }
 
         let result = self.emit(
@@ -348,10 +235,21 @@ impl StreamingState {
 
         let mut chunks = Vec::new();
 
-        // Thinking 块结束时发送暂存的签名
-        if self.block_type == BlockType::Thinking && self.signatures.has_pending() {
-            if let Some(signature) = self.signatures.consume() {
-                chunks.push(self.emit_delta("signature_delta", json!({ "signature": signature })));
+        // Thinking 块结束时发送暂存的签名（上游未下发时回退到会话签名）。
+        // **绝不发明哨兵** —— 哨兵是"跳过校验"开关而非假合法签名，
+        // 下发给客户端只会污染其历史；且官方流量里出现 0/23 次，不属于 Antigravity 协议。
+        // 真签名的恢复由网关侧 SQL 状态机（`hydrate`）与终审 `place_turn_signature` 承担。
+        if self.block_type == BlockType::Thinking {
+            let signature = if self.signatures.has_pending() {
+                self.signatures.consume()
+            } else {
+                self.session_id.as_deref().and_then(|sid| {
+                    crate::proxy::SignatureCache::global().get_session_signature(sid)
+                })
+            };
+
+            if let Some(sig) = signature {
+                chunks.push(self.emit_delta("signature_delta", json!({ "signature": sig })));
             }
         }
 
@@ -363,6 +261,36 @@ impl StreamingState {
             }),
         ));
 
+        self.block_index += 1;
+        self.block_type = BlockType::None;
+
+        chunks
+    }
+
+    /// 为 trailingSignature 发射独立的自闭合 synthetic thinking 块，并合法递增 block_index
+    pub fn emit_trailing_signature_block(&mut self, trailing_sig: String) -> Vec<Bytes> {
+        let mut chunks = Vec::new();
+        if self.block_type != BlockType::None {
+            chunks.extend(self.end_block());
+        }
+
+        chunks.push(self.emit(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": self.block_index,
+                "content_block": { "type": "thinking", "thinking": "" }
+            }),
+        ));
+        chunks.push(self.emit_delta("thinking_delta", json!({ "thinking": "" })));
+        chunks.push(self.emit_delta("signature_delta", json!({ "signature": trailing_sig })));
+        chunks.push(self.emit(
+            "content_block_stop",
+            json!({
+                "type": "content_block_stop",
+                "index": self.block_index
+            }),
+        ));
         self.block_index += 1;
         self.block_type = BlockType::None;
 
@@ -445,7 +373,8 @@ impl StreamingState {
                 }
             }
 
-            if !grounding_text.is_empty() {
+            let trimmed_grounding = grounding_text.trim();
+            if !trimmed_grounding.is_empty() {
                 // 发送一个新的 text 块
                 chunks.push(self.emit(
                     "content_block_start",
@@ -455,7 +384,7 @@ impl StreamingState {
                         "content_block": { "type": "text", "text": "" }
                     }),
                 ));
-                chunks.push(self.emit_delta("text_delta", json!({ "text": grounding_text })));
+                chunks.push(self.emit_delta("text_delta", json!({ "text": trimmed_grounding })));
                 chunks.push(self.emit(
                     "content_block_stop",
                     json!({ "type": "content_block_stop", "index": self.block_index }),
@@ -473,7 +402,8 @@ impl StreamingState {
             "end_turn"
         };
 
-        let usage = usage_metadata
+        let effective_usage = usage_metadata.or(self.last_usage.as_ref());
+        let usage = effective_usage
             .map(|u| {
                 // [FIX] Record actual token usage for calibrator learning
                 // Now properly pairs estimated tokens from request with actual tokens from response
@@ -495,9 +425,7 @@ impl StreamingState {
             .unwrap_or(Usage {
                 input_tokens: 0,
                 output_tokens: 0,
-                cache_read_input_tokens: None,
-                cache_creation_input_tokens: None,
-                server_tool_use: None,
+                ..Default::default()
             });
 
         chunks.push(self.emit(
@@ -530,6 +458,7 @@ impl StreamingState {
     }
 
     /// 获取当前块索引
+    #[allow(dead_code)]
     pub fn current_block_index(&self) -> usize {
         self.block_index
     }
@@ -577,7 +506,10 @@ impl StreamingState {
         #[cfg(debug_assertions)]
         {
             let preview = if raw_data.len() > 100 {
-                format!("{}...", &raw_data[..100])
+                format!(
+                    "{}...",
+                    crate::proxy::mappers::common_utils::safe_truncate_str(raw_data, 100)
+                )
             } else {
                 raw_data.to_string()
             };
@@ -593,19 +525,32 @@ impl StreamingState {
             );
 
             // [FIX] Explicitly signal error to client to prevent UI freeze
-            // Using "network_error" type to suggest network/proxy issues
+            // using standard SSE error event format
+            // data: {"type": "error", "error": {...}}
+            let report = crate::proxy::mappers::error_classifier::report_stream_error(
+                "claude",
+                "StreamingState::handle_parse_error",
+                &"sse parse error",
+                format!(
+                    "session={} model={} messages={} parse_error_count={} raw_bytes={} preview={}",
+                    self.session_id.as_deref().unwrap_or("-"),
+                    self.model_name.as_deref().unwrap_or("-"),
+                    self.message_count,
+                    self.parse_error_count,
+                    raw_data.len(),
+                    crate::proxy::mappers::error_classifier::preview_payload(raw_data)
+                ),
+            );
             chunks.push(self.emit(
                 "error",
                 json!({
                     "type": "error",
                     "error": {
-                        "type": "network_error",
-                        "message": "网络连接不稳定,请检查您的网络或代理设置。",
-                        "code": "stream_decode_error",
-                        "details": {
-                            "error_count": self.parse_error_count,
-                            "suggestion": "请尝试: 1) 检查网络连接 2) 更换代理节点 3) 稍后重试"
-                        }
+                        "type": "api_error",
+                        "message": report.client_message(),
+                        "function": report.function,
+                        "call_site": report.call_site(),
+                        "params": report.params,
                     }
                 }),
             ));
@@ -641,51 +586,17 @@ impl<'a> PartProcessor<'a> {
     /// 处理单个 part
     pub fn process(&mut self, part: &GeminiPart) -> Vec<Bytes> {
         let mut chunks = Vec::new();
-        // [FIX #545] Decode Base64 signature if present (Gemini sends Base64, Claude expects Raw)
-        let signature = part.thought_signature.as_ref().map(|sig| {
-            // Try to decode as base64
-            use base64::Engine;
-            match base64::engine::general_purpose::STANDARD.decode(sig) {
-                Ok(decoded_bytes) => {
-                    match String::from_utf8(decoded_bytes) {
-                        Ok(decoded_str) => {
-                            tracing::debug!(
-                                "[Streaming] Decoded base64 signature (len {} -> {})",
-                                sig.len(),
-                                decoded_str.len()
-                            );
-                            decoded_str
-                        }
-                        Err(_) => sig.clone(), // Not valid UTF-8, keep as is
-                    }
-                }
-                Err(_) => sig.clone(), // Not base64, keep as is
-            }
-        });
+        // Gemini thought_signature is a base64 protobuf string (e.g. EiY... or EtY...)
+        // DO NOT decode it to raw UTF-8 bytes: that corrupts ASCII-range protobufs (like UUID tags 0x12, 0x26, 0x0a, 0x24)
+        // into control characters, shrinks length below MIN_SIGNATURE_LENGTH, and breaks Gemini signature validation.
+        let signature = part.thought_signature.clone();
 
         // 1. FunctionCall 处理
         if let Some(fc) = &part.function_call {
             // 先处理 trailingSignature (B4/C3 场景)
             if self.state.has_trailing_signature() {
-                chunks.extend(self.state.end_block());
                 if let Some(trailing_sig) = self.state.trailing_signature.take() {
-                    chunks.push(self.state.emit(
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start",
-                            "index": self.state.current_block_index(),
-                            "content_block": { "type": "thinking", "thinking": "" }
-                        }),
-                    ));
-                    chunks.push(
-                        self.state
-                            .emit_delta("thinking_delta", json!({ "thinking": "" })),
-                    );
-                    chunks.push(
-                        self.state
-                            .emit_delta("signature_delta", json!({ "signature": trailing_sig })),
-                    );
-                    chunks.extend(self.state.end_block());
+                    chunks.extend(self.state.emit_trailing_signature_block(trailing_sig));
                 }
             }
 
@@ -725,25 +636,8 @@ impl<'a> PartProcessor<'a> {
 
         // 处理之前的 trailingSignature
         if self.state.has_trailing_signature() {
-            chunks.extend(self.state.end_block());
             if let Some(trailing_sig) = self.state.trailing_signature.take() {
-                chunks.push(self.state.emit(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": self.state.current_block_index(),
-                        "content_block": { "type": "thinking", "thinking": "" }
-                    }),
-                ));
-                chunks.push(
-                    self.state
-                        .emit_delta("thinking_delta", json!({ "thinking": "" })),
-                );
-                chunks.push(
-                    self.state
-                        .emit_delta("signature_delta", json!({ "signature": trailing_sig })),
-                );
-                chunks.extend(self.state.end_block());
+                chunks.extend(self.state.emit_trailing_signature_block(trailing_sig));
             }
         }
 
@@ -765,6 +659,14 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
+        // [NEW] Apply Client Adapter Strategy
+        let use_fifo = self
+            .state
+            .client_adapter
+            .as_ref()
+            .map(|a| a.signature_buffer_strategy() == SignatureBufferStrategy::Fifo)
+            .unwrap_or(false);
+
         // [IMPROVED] Store signature to global cache
         if let Some(ref sig) = signature {
             // 1. Cache family if we know the model
@@ -774,15 +676,21 @@ impl<'a> PartProcessor<'a> {
 
             // 2. [NEW v3.3.17] Cache to session-based storage for tool loop recovery
             if let Some(session_id) = &self.state.session_id {
+                // If FIFO strategy is enabled, use a unique index for each signature (e.g. timestamp or counter)
+                // However, our cache implementation currently keys by session_id.
+                // For FIFO, we might just rely on the fact that we are processing in order.
+                // But specifically for opencode, it might be calling tools in parallel or sequence.
+
                 SignatureCache::global().cache_session_signature(
-                    session_id, 
-                    sig.clone(), 
-                    self.state.message_count
+                    session_id,
+                    sig.clone(),
+                    self.state.message_count,
                 );
                 tracing::debug!(
-                    "[Claude-SSE] Cached signature to session {} (length: {})",
+                    "[Claude-SSE] Cached signature to session {} (length: {}) [FIFO: {}]",
                     session_id,
-                    sig.len()
+                    sig.len(),
+                    use_fifo
                 );
             }
 
@@ -793,6 +701,9 @@ impl<'a> PartProcessor<'a> {
         }
 
         // 暂存签名 (for local block handling)
+        // If FIFO, we strictly follow the sequence. The default logic is effectively LIFO for a single turn
+        // (store latest, consume at end).
+        // For opencode, we just want to ensure we capture IT.
         self.state.store_signature(signature);
 
         chunks
@@ -815,25 +726,8 @@ impl<'a> PartProcessor<'a> {
 
         // 处理之前的 trailingSignature
         if self.state.has_trailing_signature() {
-            chunks.extend(self.state.end_block());
             if let Some(trailing_sig) = self.state.trailing_signature.take() {
-                chunks.push(self.state.emit(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": self.state.current_block_index(),
-                        "content_block": { "type": "thinking", "thinking": "" }
-                    }),
-                ));
-                chunks.push(
-                    self.state
-                        .emit_delta("thinking_delta", json!({ "thinking": "" })),
-                );
-                chunks.push(
-                    self.state
-                        .emit_delta("signature_delta", json!({ "signature": trailing_sig })),
-                );
-                chunks.extend(self.state.end_block());
+                chunks.extend(self.state.emit_trailing_signature_block(trailing_sig));
             }
         }
 
@@ -925,6 +819,13 @@ impl<'a> PartProcessor<'a> {
             return vec![];
         }
 
+        // [FIX #3379] call:default_api:* leakage recovery bridge
+        // Attempt to recover leaked tool-call text as a proper tool_use block.
+        // Strict Fail-Closed: any unmet guard falls through to normal text_delta.
+        if let Some(recovery_chunks) = self.try_recover_call_default_api_text(text) {
+            return recovery_chunks;
+        }
+
         if self.state.current_block_type() != BlockType::Text {
             chunks.extend(
                 self.state
@@ -932,9 +833,221 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
+        self.state.text_delta_emitted_this_turn = true;
         chunks.push(self.state.emit_delta("text_delta", json!({ "text": text })));
 
         chunks
+    }
+
+    // -------------------------------------------------------------------------
+    // [FIX #3379] Helpers: call:default_api:* leakage detection & recovery
+    // -------------------------------------------------------------------------
+
+    /// Attempt to extract `(tool_name, args_str)` from a raw `call:default_api:*` text.
+    /// Returns None if the text does not strictly match the expected prefix format.
+    fn try_parse_call_default_api(text: &str) -> Option<(String, String)> {
+        const PREFIX: &str = "call:default_api:";
+        let trimmed = text.trim();
+        if !trimmed.starts_with(PREFIX) {
+            return None;
+        }
+        let rest = &trimmed[PREFIX.len()..];
+        // Tool name ends at the first `{` or `(` delimiter
+        let tool_end = rest.find(|c| c == '{' || c == '(').unwrap_or(rest.len());
+        let tool_name = rest[..tool_end].trim().to_string();
+        if tool_name.is_empty() {
+            return None;
+        }
+        let args_str = rest[tool_end..].trim().to_string();
+        Some((tool_name, args_str))
+    }
+
+    /// Two-phase JSON argument parser for Gemini's loose call:default_api format.
+    ///
+    /// Phase 1: standard `serde_json` parse (handles well-formed JSON).
+    /// Phase 2: lenient key-quoting heuristic for unquoted keys (e.g. `{file_path:foo}`).
+    /// Returns `None` (guard G6) if both phases fail.
+    fn parse_loose_json_args(args_str: &str) -> Option<serde_json::Value> {
+        if args_str.is_empty() {
+            // No-arg tool call → valid empty object
+            return Some(serde_json::json!({}));
+        }
+
+        // Phase 1: strict JSON
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_str) {
+            if v.is_object() {
+                return Some(v);
+            }
+        }
+
+        // Phase 2: lenient key-quoting for Gemini's internal pseudo-JSON
+        // Only attempt if the string looks like a {…} block.
+        let s = args_str.trim();
+        if !s.starts_with('{') || !s.ends_with('}') {
+            return None;
+        }
+        let inner = &s[1..s.len() - 1];
+
+        // Naïve key-quoting: add double-quotes around bare identifier keys.
+        // This covers the most common Gemini output patterns.
+        let mut result = String::from("{");
+        let mut in_value = false;
+        let mut i = 0;
+        let chars: Vec<char> = inner.chars().collect();
+        while i < chars.len() {
+            let c = chars[i];
+            match c {
+                ',' if !in_value => {
+                    result.push(',');
+                    i += 1;
+                }
+                ':' => {
+                    result.push(':');
+                    in_value = true;
+                    i += 1;
+                }
+                '"' if in_value => {
+                    // Quoted value — pass through until closing quote
+                    result.push('"');
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        if chars[i] == '\\' {
+                            result.push('\\');
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            result.push(chars[i]);
+                            i += 1;
+                        }
+                    }
+                    if i < chars.len() {
+                        result.push('"');
+                        i += 1;
+                    }
+                    in_value = false;
+                }
+                _ if !in_value => {
+                    // Bare key — wrap with quotes
+                    let key_start = i;
+                    while i < chars.len() && chars[i] != ':' && chars[i] != ',' {
+                        i += 1;
+                    }
+                    let key: String = chars[key_start..i].iter().collect();
+                    let key_trimmed = key.trim();
+                    result.push('"');
+                    result.push_str(key_trimmed);
+                    result.push('"');
+                }
+                _ => {
+                    // Bare value — collect until `,` or end
+                    let val_start = i;
+                    while i < chars.len() && chars[i] != ',' {
+                        result.push(chars[i]);
+                        i += 1;
+                    }
+                    let _ = val_start; // consumed inline
+                    in_value = false;
+                }
+            }
+        }
+        result.push('}');
+
+        serde_json::from_str::<serde_json::Value>(&result)
+            .ok()
+            .filter(|v| v.is_object())
+    }
+
+    /// Fail-Closed recovery: attempts to convert a `call:default_api:*` text leak
+    /// into a proper `tool_use` block by passing 7 strict guards.
+    ///
+    /// Returns `Some(chunks)` when recovery succeeds, or `None` to let the caller
+    /// fall through to the normal `text_delta` path.
+    fn try_recover_call_default_api_text(&mut self, text: &str) -> Option<Vec<bytes::Bytes>> {
+        // G1: Tools must have been registered for this request
+        if self.state.registered_tool_names.is_empty() {
+            return None;
+        }
+
+        // G3: Strict prefix check before doing any expensive work
+        if !text.trim().starts_with("call:default_api:") {
+            return None;
+        }
+
+        let (tool_name, args_str) = Self::try_parse_call_default_api(text)?;
+
+        // G5: The entire text (trimmed) must consist solely of this one expression.
+        // This prevents documentation strings like "Use call:default_api:Read{...}" from
+        // being mistakenly executed.
+        let full_expr = format!(
+            "call:default_api:{}{}",
+            tool_name,
+            if args_str.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", args_str)
+            }
+        );
+        // Allow minor whitespace variance but reject any surrounding prose
+        let trimmed_text = text.trim();
+        // The text must start with call:default_api:<tool_name> and end right after the args block
+        if !trimmed_text.starts_with(&format!("call:default_api:{}", tool_name)) {
+            return None;
+        }
+        // After the tool name and args there must be nothing else (ignore trailing whitespace)
+        let after_tool_name = &trimmed_text["call:default_api:".len() + tool_name.len()..].trim();
+        // after_tool_name is either empty (no args) or is the args string itself
+        if !after_tool_name.is_empty()
+            && !after_tool_name.starts_with('{')
+            && !after_tool_name.starts_with('(')
+        {
+            // There is non-arg text after the tool name — reject
+            return None;
+        }
+        let _ = full_expr; // suppress unused warning
+
+        // G4: Tool name must be in the registered whitelist (exact match, case-insensitive)
+        let matched_name = self
+            .state
+            .registered_tool_names
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(&tool_name))
+            .cloned()?;
+
+        // G2: Current turn must NOT have already produced a structured functionCall
+        if self.state.used_tool {
+            tracing::warn!(
+                "[#3379] Detected call:default_api:{} leakage but used_tool=true; skipping recovery",
+                tool_name
+            );
+            return None;
+        }
+
+        // G7: No text_delta must have been emitted this turn
+        if self.state.text_delta_emitted_this_turn {
+            tracing::warn!(
+                "[#3379] Detected call:default_api:{} leakage but text_delta already emitted this turn; skipping recovery",
+                tool_name
+            );
+            return None;
+        }
+
+        // G6: Arguments must parse as a valid JSON object
+        let parsed_args = Self::parse_loose_json_args(&args_str)?;
+
+        // All guards passed — perform recovery
+        tracing::warn!(
+            "[#3379-RECOVERY] Recovering call:default_api:{} as tool_use (args_len={})",
+            matched_name,
+            args_str.len()
+        );
+
+        let fc = FunctionCall {
+            name: matched_name,
+            args: Some(parsed_args),
+            id: None,
+        };
+
+        Some(self.process_function_call(&fc, None))
     }
 
     /// Process FunctionCall and capture signature for global storage
@@ -955,11 +1068,10 @@ impl<'a> PartProcessor<'a> {
             )
         });
 
-        let mut tool_name = fc.name.clone();
-        if tool_name.to_lowercase() == "search" {
-            tool_name = "grep".to_string();
-            tracing::debug!("[Streaming] Normalizing tool name: Search → grep");
-        }
+        let tool_name = fc.name.clone();
+
+        // Record real tool_id into TurnAccumulator for precise session/fingerprint recovery
+        self.state.thinking_acc.record_tool_id(&tool_name, &tool_id);
 
         // 1. 发送 content_block_start (input 为空对象)
         let mut tool_use = json!({
@@ -973,14 +1085,16 @@ impl<'a> PartProcessor<'a> {
             tool_use["signature"] = json!(sig);
 
             // 2. Cache tool signature (Layer 1 recovery)
-            SignatureCache::global().cache_tool_signature(&tool_id, sig.clone());
+            if let Some(sid) = self.state.session_id.as_deref() {
+                SignatureCache::global().cache_tool_signature(sid, &tool_id, sig.clone());
+            }
 
             // 3. [NEW v3.3.17] Cache to session-based storage
             if let Some(session_id) = &self.state.session_id {
                 SignatureCache::global().cache_session_signature(
-                    session_id, 
+                    session_id,
                     sig.clone(),
-                    self.state.message_count
+                    self.state.message_count,
                 );
             }
 
@@ -993,22 +1107,23 @@ impl<'a> PartProcessor<'a> {
         chunks.extend(self.state.start_block(BlockType::Function, tool_use));
 
         // 2. 发送 input_json_delta (完整的参数 JSON 字符串)
-        // [FIX] Remap args before serialization for Gemini → Claude compatibility
-        if let Some(args) = &fc.args {
-            let mut remapped_args = args.clone();
+        // [FIX #Bug2/#Bug4] ALWAYS emit input_json_delta, even for empty/null args.
+        // Claude protocol requires this delta before content_block_stop.
+        // Skipping it causes clients (Claude Code) to misinterpret tool calls as text.
+        {
+            let json_str = if let Some(args) = &fc.args {
+                let mut remapped_args = args.clone();
+                remap_function_call_args(&fc.name, &mut remapped_args);
+                serde_json::to_string(&remapped_args).unwrap_or_else(|_| "{}".to_string())
+            } else {
+                // [FIX #Bug4] No args provided (e.g. EnterPlanMode): emit empty JSON object
+                tracing::debug!(
+                    "[Streaming] Tool '{}' has no args, emitting empty input_json_delta",
+                    fc.name
+                );
+                "{}".to_string()
+            };
 
-            let tool_name_title = fc.name.clone();
-            // [OPTIMIZED] Only rename if it's "search" which is a known hallucination.
-            // Avoid renaming "grep" to "Grep" if possible to protect signature,
-            // unless we're sure Grep is the standard.
-            let mut final_tool_name = tool_name_title;
-            if final_tool_name.to_lowercase() == "search" {
-                final_tool_name = "Grep".to_string();
-            }
-            remap_function_call_args(&final_tool_name, &mut remapped_args);
-
-            let json_str =
-                serde_json::to_string(&remapped_args).unwrap_or_else(|_| "{}".to_string());
             chunks.push(
                 self.state
                     .emit_delta("input_json_delta", json!({ "partial_json": json_str })),
@@ -1091,5 +1206,375 @@ mod tests {
 
         // 3. content_block_stop
         assert!(output.contains(r#""type":"content_block_stop""#));
+    }
+
+    /// [FIX #Bug4] Tool with args=None MUST still emit input_json_delta with "{}"
+    #[test]
+    fn test_process_function_call_no_args_emits_empty_delta() {
+        let mut state = StreamingState::new();
+        let mut processor = PartProcessor::new(&mut state);
+
+        let fc = FunctionCall {
+            name: "EnterPlanMode".to_string(),
+            args: None, // No args at all
+            id: Some("call_no_args".to_string()),
+        };
+
+        let part = GeminiPart {
+            text: None,
+            function_call: Some(fc),
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+
+        let chunks = processor.process(&part);
+        let output = chunks
+            .iter()
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .join("");
+
+        // Must have tool_use block start
+        assert!(output.contains(r#""type":"content_block_start""#));
+        assert!(output.contains(r#""name":"EnterPlanMode""#));
+
+        // [FIX #Bug4] Must emit input_json_delta even for None args
+        assert!(
+            output.contains(r#""type":"input_json_delta""#),
+            "MUST emit input_json_delta even when args is None; output={}",
+            &output[..output.len().min(600)]
+        );
+        assert!(
+            output.contains(r#""partial_json":"{}""#),
+            "input_json_delta must be empty JSON object for None args"
+        );
+
+        // Must close block
+        assert!(output.contains(r#""type":"content_block_stop""#));
+        assert!(state.used_tool);
+    }
+
+    /// [FIX #Bug2] Tool with args=Some({}) (empty obj) MUST still emit input_json_delta
+    #[test]
+    fn test_process_function_call_empty_args_emits_delta() {
+        let mut state = StreamingState::new();
+        let mut processor = PartProcessor::new(&mut state);
+
+        let fc = FunctionCall {
+            name: "SomeTool".to_string(),
+            args: Some(json!({})), // Empty args object
+            id: Some("call_empty".to_string()),
+        };
+
+        let part = GeminiPart {
+            text: None,
+            function_call: Some(fc),
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+
+        let chunks = processor.process(&part);
+        let output = chunks
+            .iter()
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .join("");
+
+        // [FIX #Bug2] Must emit input_json_delta for empty object args
+        assert!(
+            output.contains(r#""type":"input_json_delta""#),
+            "Must emit input_json_delta for empty args object; output={}",
+            &output[..output.len().min(600)]
+        );
+        assert!(state.used_tool);
+    }
+
+    // -------------------------------------------------------------------------
+    // [FIX #3379] Tests: call:default_api:* leakage recovery
+    // -------------------------------------------------------------------------
+
+    /// Helper: build a PartProcessor with registered tool names
+    fn make_processor_with_tools<'a>(
+        state: &'a mut StreamingState,
+        tools: Vec<&str>,
+    ) -> PartProcessor<'a> {
+        state.set_registered_tool_names(tools.into_iter().map(|s| s.to_string()).collect());
+        PartProcessor::new(state)
+    }
+
+    /// Collect all SSE chunks into a single string
+    fn chunks_to_string(chunks: &[bytes::Bytes]) -> String {
+        chunks
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn test_3379_positive_recovery_standard_json() {
+        // Positive: registered tool, standard JSON args, no prose → should recover
+        let mut state = StreamingState::new();
+        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
+
+        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt","limit":100}"#;
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        // Should produce a tool_use block, not a text_delta
+        assert!(
+            output.contains(r#""type":"content_block_start""#),
+            "Expected tool_use block_start, got: {}",
+            output
+        );
+        assert!(
+            output.contains(r#""name":"Read""#),
+            "Expected tool name Read"
+        );
+        assert!(
+            !output.contains("text_delta"),
+            "Must NOT produce text_delta for recovered call"
+        );
+        assert!(state.used_tool, "used_tool must be true after recovery");
+    }
+
+    #[test]
+    fn test_3379_negative_tool_not_registered() {
+        // G4 guard: tool name not in whitelist → text_delta
+        let mut state = StreamingState::new();
+        let mut processor = make_processor_with_tools(&mut state, vec!["Write"]);
+
+        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt"}"#;
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "Unregistered tool must fall through to text_delta"
+        );
+        assert!(!state.used_tool, "used_tool must remain false");
+    }
+
+    #[test]
+    fn test_3379_negative_no_tools_registered() {
+        // G1 guard: no tools in request → text_delta
+        let mut state = StreamingState::new(); // no registered_tool_names
+        let mut processor = PartProcessor::new(&mut state);
+
+        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt"}"#;
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "Empty registered_tool_names must fall through to text_delta"
+        );
+    }
+
+    #[test]
+    fn test_3379_negative_surrounding_prose() {
+        // G5 guard: text not solely the call expression → text_delta
+        let mut state = StreamingState::new();
+        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
+
+        let text = "Here is what I am doing: call:default_api:Read{\"file_path\":\"/tmp/foo.txt\"}";
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "Prose-wrapped call must fall through to text_delta"
+        );
+        assert!(!state.used_tool);
+    }
+
+    #[test]
+    fn test_3379_negative_broken_json_args() {
+        // G6 guard: args not valid JSON → text_delta
+        let mut state = StreamingState::new();
+        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
+
+        let text = "call:default_api:Read{file_path: NOT JSON !!!}";
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "Broken JSON args must fall through to text_delta"
+        );
+        assert!(!state.used_tool);
+    }
+
+    #[test]
+    fn test_3379_negative_text_delta_already_emitted() {
+        // G7 guard: text_delta already emitted this turn → skip recovery
+        let mut state = StreamingState::new();
+        state.set_registered_tool_names(vec!["Read".to_string()]);
+        // Simulate a prior text_delta having been emitted
+        state.text_delta_emitted_this_turn = true;
+
+        let mut processor = PartProcessor::new(&mut state);
+        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt"}"#;
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "G7 must prevent recovery after text_delta was emitted"
+        );
+        assert!(!state.used_tool);
+    }
+
+    #[test]
+    fn test_3379_parse_loose_json_standard() {
+        // parse_loose_json_args: standard JSON passes Phase 1
+        let result =
+            PartProcessor::parse_loose_json_args(r#"{"file_path":"/tmp/foo","limit":100}"#);
+        assert!(result.is_some());
+        let v = result.unwrap();
+        assert_eq!(v["file_path"], "/tmp/foo");
+        assert_eq!(v["limit"], 100);
+    }
+
+    #[test]
+    fn test_3379_parse_loose_json_empty() {
+        // Empty args → valid empty object
+        let result = PartProcessor::parse_loose_json_args("");
+        assert_eq!(result, Some(serde_json::json!({})));
+    }
+
+    #[test]
+    fn test_3379_regression_native_function_call_unaffected() {
+        // Regression: native functionCall must still produce tool_use unaffected
+        let mut state = StreamingState::new();
+        state.set_registered_tool_names(vec!["Read".to_string()]);
+        let mut processor = PartProcessor::new(&mut state);
+
+        let fc = FunctionCall {
+            name: "Read".to_string(),
+            args: Some(json!({"file_path": "/tmp/native.txt"})),
+            id: Some("call_native_001".to_string()),
+        };
+        let part = GeminiPart {
+            text: None,
+            function_call: Some(fc),
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains(r#""type":"content_block_start""#),
+            "Native functionCall must still produce tool_use"
+        );
+        assert!(output.contains(r#""name":"Read""#));
+        assert!(!output.contains("text_delta"));
+        assert!(state.used_tool);
+    }
+
+    #[test]
+    fn test_handle_parse_error_emits_standard_api_error() {
+        let mut state = StreamingState::new();
+        // Call handle_parse_error 4 times to exceed threshold (> 3)
+        let _ = state.handle_parse_error("invalid chunk 1");
+        let _ = state.handle_parse_error("invalid chunk 2");
+        let _ = state.handle_parse_error("invalid chunk 3");
+        let chunks = state.handle_parse_error("invalid chunk 4");
+
+        let output = chunks_to_string(&chunks);
+        assert!(output.contains("event: error"), "Must emit error event");
+        assert!(
+            output.contains(r#""type":"api_error""#),
+            "Anthropic SSE error type must be standard 'api_error', got: {}",
+            output
+        );
+        assert!(
+            !output.contains(r#""type":"decode_error""#),
+            "Must not leak internal non-standard 'decode_error'"
+        );
+    }
+
+    #[test]
+    fn test_trailing_signature_synthetic_block_is_closed_and_increments_index() {
+        let mut state = StreamingState::new();
+        state.set_trailing_signature(Some("sig_test_trailing_123".to_string()));
+        assert!(state.has_trailing_signature());
+
+        let mut processor = PartProcessor::new(&mut state);
+        let part = GeminiPart {
+            text: Some("Next turn text".to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        // 1. Synthetic thinking block (index 0) must have start, delta, signature_delta, stop
+        assert!(output.contains(r#""type":"content_block_start""#));
+        assert!(output.contains(r#""type":"signature_delta""#));
+        assert!(output.contains("sig_test_trailing_123"));
+        assert!(output.contains(r#""type":"content_block_stop","index":0"#));
+
+        // 2. Next text block must have index 1, NOT duplicate index 0
+        assert!(output.contains(r#""type":"content_block_start","index":1"#));
+        assert!(output.contains("Next turn text"));
     }
 }

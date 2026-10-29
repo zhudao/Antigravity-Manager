@@ -1,20 +1,22 @@
 import { create } from 'zustand';
-import { Account } from '../types/account';
+import { Account, ActiveClientsStatus } from '../types/account';
 import * as accountService from '../services/accountService';
 
 interface AccountState {
     accounts: Account[];
     currentAccount: Account | null;
+    activeClients: ActiveClientsStatus;
     loading: boolean;
     error: string | null;
 
     // Actions
     fetchAccounts: () => Promise<void>;
     fetchCurrentAccount: () => Promise<void>;
+    fetchActiveClients: () => Promise<void>;
     addAccount: (email: string, refreshToken: string) => Promise<void>;
     deleteAccount: (accountId: string) => Promise<void>;
     deleteAccounts: (accountIds: string[]) => Promise<void>;
-    switchAccount: (accountId: string) => Promise<void>;
+    switchAccount: (accountId: string, targetIde?: string) => Promise<void>;
     refreshQuota: (accountId: string) => Promise<void>;
     refreshAllQuotas: () => Promise<accountService.RefreshStats>;
     reorderAccounts: (accountIds: string[]) => Promise<void>;
@@ -24,17 +26,64 @@ interface AccountState {
     completeOAuthLogin: () => Promise<void>;
     cancelOAuthLogin: () => Promise<void>;
     importV1Accounts: () => Promise<void>;
+    batchImportAccounts: (entries: accountService.ImportAccountEntry[]) => Promise<accountService.BatchImportResult>;
     importFromDb: () => Promise<void>;
     importFromCustomDb: (path: string) => Promise<void>;
     syncAccountFromDb: () => Promise<void>;
     toggleProxyStatus: (accountId: string, enable: boolean, reason?: string) => Promise<void>;
     warmUpAccounts: () => Promise<string>;
     warmUpAccount: (accountId: string) => Promise<string>;
+    updateAccountLabel: (accountId: string, label: string) => Promise<void>;
+    updateAccountPriority: (accountId: string, priority: number) => Promise<void>;
 }
 
+const ACCOUNTS_CACHE_KEY = 'antigravity_accounts_cache';
+const CURRENT_ACCOUNT_CACHE_KEY = 'antigravity_current_account_cache';
+const ACTIVE_CLIENTS_CACHE_KEY = 'antigravity_active_clients_cache';
+
+const getInitialAccounts = (): Account[] => {
+    try {
+        const saved = localStorage.getItem(ACCOUNTS_CACHE_KEY);
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+                return parsed;
+            }
+        }
+    } catch (_) {}
+    return [];
+};
+
+const getInitialCurrentAccount = (): Account | null => {
+    try {
+        const saved = localStorage.getItem(CURRENT_ACCOUNT_CACHE_KEY);
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            if (parsed && typeof parsed === 'object') {
+                return parsed;
+            }
+        }
+    } catch (_) {}
+    return null;
+};
+
+const getInitialActiveClients = (): ActiveClientsStatus => {
+    try {
+        const saved = localStorage.getItem(ACTIVE_CLIENTS_CACHE_KEY);
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            if (parsed && typeof parsed === 'object') {
+                return parsed;
+            }
+        }
+    } catch (_) {}
+    return {};
+};
+
 export const useAccountStore = create<AccountState>((set, get) => ({
-    accounts: [],
-    currentAccount: null,
+    accounts: getInitialAccounts(),
+    currentAccount: getInitialCurrentAccount(),
+    activeClients: getInitialActiveClients(),
     loading: false,
     error: null,
 
@@ -42,8 +91,15 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             console.log('[Store] Fetching accounts...');
-            const accounts = await accountService.listAccounts();
-            set({ accounts, loading: false });
+            const [accounts, activeClients] = await Promise.all([
+                accountService.listAccounts(),
+                accountService.getActiveClientsStatus().catch(() => ({} as ActiveClientsStatus))
+            ]);
+            try {
+                localStorage.setItem(ACCOUNTS_CACHE_KEY, JSON.stringify(accounts));
+                localStorage.setItem(ACTIVE_CLIENTS_CACHE_KEY, JSON.stringify(activeClients));
+            } catch (_) {}
+            set({ accounts, activeClients, loading: false });
         } catch (error) {
             console.error('[Store] Fetch accounts failed:', error);
             set({ error: String(error), loading: false });
@@ -53,10 +109,30 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     fetchCurrentAccount: async () => {
         set({ loading: true, error: null });
         try {
-            const account = await accountService.getCurrentAccount();
-            set({ currentAccount: account, loading: false });
+            const [account, activeClients] = await Promise.all([
+                accountService.getCurrentAccount(),
+                accountService.getActiveClientsStatus().catch(() => ({} as ActiveClientsStatus))
+            ]);
+            try {
+                if (account) {
+                    localStorage.setItem(CURRENT_ACCOUNT_CACHE_KEY, JSON.stringify(account));
+                } else {
+                    localStorage.removeItem(CURRENT_ACCOUNT_CACHE_KEY);
+                }
+                localStorage.setItem(ACTIVE_CLIENTS_CACHE_KEY, JSON.stringify(activeClients));
+            } catch (_) {}
+            set({ currentAccount: account, activeClients, loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
+        }
+    },
+
+    fetchActiveClients: async () => {
+        try {
+            const activeClients = await accountService.getActiveClientsStatus();
+            set({ activeClients });
+        } catch (error) {
+            console.error('[Store] Fetch active clients failed:', error);
         }
     },
 
@@ -102,11 +178,14 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         }
     },
 
-    switchAccount: async (accountId: string) => {
+    switchAccount: async (accountId: string, targetIde?: string) => {
         set({ loading: true, error: null });
         try {
-            await accountService.switchAccount(accountId);
-            await get().fetchCurrentAccount();
+            await accountService.switchAccount(accountId, targetIde);
+            await Promise.all([
+                get().fetchCurrentAccount(),
+                get().fetchActiveClients(),
+            ]);
             set({ loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
@@ -216,6 +295,19 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         }
     },
 
+    batchImportAccounts: async (entries: accountService.ImportAccountEntry[]) => {
+        set({ loading: true, error: null });
+        try {
+            const res = await accountService.batchImportAccounts(entries);
+            await get().fetchAccounts();
+            set({ loading: false });
+            return res;
+        } catch (error) {
+            set({ error: String(error), loading: false });
+            throw error;
+        }
+    },
+
     importFromDb: async () => {
         set({ loading: true, error: null });
         try {
@@ -273,12 +365,13 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             const result = await accountService.warmUpAllAccounts();
-            await get().fetchAccounts();
             set({ loading: false });
             return result;
         } catch (error) {
             set({ error: String(error), loading: false });
             throw error;
+        } finally {
+            await get().fetchAccounts();
         }
     },
 
@@ -286,11 +379,35 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             const result = await accountService.warmUpAccount(accountId);
-            await get().fetchAccounts();
             set({ loading: false });
             return result;
         } catch (error) {
             set({ error: String(error), loading: false });
+            throw error;
+        } finally {
+            await get().fetchAccounts();
+        }
+    },
+
+    updateAccountPriority: async (accountId, priority) => {
+        await accountService.updateAccountPriority(accountId, priority);
+        set(state => ({
+            accounts: state.accounts.map(account => account.id === accountId ? { ...account, priority } : account),
+            currentAccount: state.currentAccount?.id === accountId ? { ...state.currentAccount, priority } : state.currentAccount,
+        }));
+    },
+
+    updateAccountLabel: async (accountId: string, label: string) => {
+        try {
+            await accountService.updateAccountLabel(accountId, label);
+            // 乐观更新本地状态
+            const { accounts } = get();
+            const updatedAccounts = accounts.map(acc =>
+                acc.id === accountId ? { ...acc, custom_label: label || undefined } : acc
+            );
+            set({ accounts: updatedAccounts });
+        } catch (error) {
+            console.error('[AccountStore] Update label failed:', error);
             throw error;
         }
     },

@@ -1,5 +1,5 @@
 cask "antigravity-tools" do
-  version "4.0.5"
+  version "5.0.0"
   sha256 :no_check
 
   name "Antigravity Tools"
@@ -7,9 +7,19 @@ cask "antigravity-tools" do
   homepage "https://github.com/lbjlaq/Antigravity-Manager"
 
   on_macos do
-    url "https://github.com/lbjlaq/Antigravity-Manager/releases/download/v#{version}/Antigravity.Tools_#{version}_universal.dmg"
+    arch intel: "x64", arm: "aarch64"
+
+    url "https://github.com/lbjlaq/Antigravity-Manager/releases/download/v#{version}/Antigravity.Tools_#{version}_#{arch}.dmg"
 
     app "Antigravity Tools.app"
+    binary "#{appdir}/Antigravity Tools.app/Contents/MacOS/antigravity-tools"
+    binary "#{appdir}/Antigravity Tools.app/Contents/MacOS/antigravity-tools", target: "at"
+
+    postflight_steps do
+      run "/usr/bin/xattr",
+          args:         ["-rd", "com.apple.quarantine", "{{appdir}}/Antigravity Tools.app"],
+          must_succeed: false
+    end
 
     zap trash: [
       "~/Library/Application Support/com.lbjlaq.antigravity-tools",
@@ -17,14 +27,6 @@ cask "antigravity-tools" do
       "~/Library/Preferences/com.lbjlaq.antigravity-tools.plist",
       "~/Library/Saved Application State/com.lbjlaq.antigravity-tools.savedState",
     ]
-
-    caveats <<~EOS
-      If you encounter the "App is damaged" error, please run the following command:
-        sudo xattr -rd com.apple.quarantine "/Applications/Antigravity Tools.app"
-
-      Or install with the --no-quarantine flag:
-        brew install --cask --no-quarantine antigravity-tools
-    EOS
   end
 
   on_linux do
@@ -33,8 +35,8 @@ cask "antigravity-tools" do
     url "https://github.com/lbjlaq/Antigravity-Manager/releases/download/v#{version}/Antigravity.Tools_#{version}_#{arch}.AppImage"
     binary "Antigravity.Tools_#{version}_#{arch}.AppImage", target: "antigravity-tools"
 
-    preflight do
-      system_command "/bin/chmod", args: ["+x", "#{staged_path}/Antigravity.Tools_#{version}_#{arch}.AppImage"]
+    preflight_steps do
+      set_permissions "Antigravity.Tools_{{version}}_{{arch}}.AppImage", "0755"
     end
   end
 end

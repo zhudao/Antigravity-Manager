@@ -12,6 +12,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
 /// Cloudflared隧道模式
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,13 +92,22 @@ pub struct CloudflaredManager {
 }
 
 impl CloudflaredManager {
-    pub fn new(data_dir: &PathBuf) -> Self {
-        let bin_name = if cfg!(target_os = "windows") {
+    fn cloudflared_bin_name() -> &'static str {
+        if cfg!(target_os = "windows") {
             "cloudflared.exe"
         } else {
             "cloudflared"
-        };
-        let bin_path = data_dir.join("bin").join(bin_name);
+        }
+    }
+
+    fn current_bin_path(&self) -> PathBuf {
+        crate::modules::account::get_data_dir()
+            .map(|dir| dir.join("bin").join(Self::cloudflared_bin_name()))
+            .unwrap_or_else(|_| self.bin_path.clone())
+    }
+
+    pub fn new(data_dir: &PathBuf) -> Self {
+        let bin_path = data_dir.join("bin").join(Self::cloudflared_bin_name());
 
         Self {
             process: Arc::new(RwLock::new(None)),
@@ -108,15 +119,16 @@ impl CloudflaredManager {
 
     /// 检查是否已安装
     pub async fn check_installed(&self) -> (bool, Option<String>) {
-        if !self.bin_path.exists() {
+        let bin_path = self.current_bin_path();
+        if !bin_path.exists() {
             return (false, None);
         }
 
-        let mut cmd = Command::new(&self.bin_path);
+        let mut cmd = Command::new(&bin_path);
         cmd.arg("--version");
         #[cfg(target_os = "windows")]
         cmd.creation_flags(CREATE_NO_WINDOW);
-        
+
         match cmd.output().await {
             Ok(output) => {
                 if output.status.success() {
@@ -146,7 +158,8 @@ impl CloudflaredManager {
 
     /// 安装cloudflared
     pub async fn install(&self) -> Result<CloudflaredStatus, String> {
-        let bin_dir = self.bin_path.parent().unwrap();
+        let bin_path = self.current_bin_path();
+        let bin_dir = bin_path.parent().unwrap();
         if !bin_dir.exists() {
             std::fs::create_dir_all(bin_dir)
                 .map_err(|e| format!("Failed to create bin directory: {}", e))?;
@@ -160,7 +173,10 @@ impl CloudflaredManager {
             .map_err(|e| format!("Download failed: {}", e))?;
 
         if !response.status().is_success() {
-            return Err(format!("Download failed with status: {}", response.status()));
+            return Err(format!(
+                "Download failed with status: {}",
+                response.status()
+            ));
         }
 
         let bytes = response
@@ -170,18 +186,22 @@ impl CloudflaredManager {
 
         let is_archive = download_url.ends_with(".tgz");
         if is_archive {
-            let archive_path = self.bin_path.with_extension("tgz");
+            let archive_path = bin_path.with_extension("tgz");
             std::fs::write(&archive_path, &bytes)
                 .map_err(|e| format!("Failed to write archive: {}", e))?;
 
-            let status = Command::new("tar")
-                .arg("-xzf")
-                .arg(&archive_path)
-                .arg("-C")
-                .arg(bin_dir)
-                .status()
-                .await
-                .map_err(|e| format!("Failed to extract archive: {}", e))?;
+            let status = {
+                let mut tar_cmd = Command::new("tar");
+                tar_cmd
+                    .arg("-xzf")
+                    .arg(&archive_path)
+                    .arg("-C")
+                    .arg(bin_dir);
+                #[cfg(target_os = "windows")]
+                tar_cmd.creation_flags(CREATE_NO_WINDOW);
+                tar_cmd.status().await
+            }
+            .map_err(|e| format!("Failed to extract archive: {}", e))?;
 
             if !status.success() {
                 return Err("Failed to extract cloudflared archive".to_string());
@@ -189,14 +209,14 @@ impl CloudflaredManager {
 
             let _ = std::fs::remove_file(&archive_path);
         } else {
-            std::fs::write(&self.bin_path, &bytes)
+            std::fs::write(&bin_path, &bytes)
                 .map_err(|e| format!("Failed to write binary: {}", e))?;
         }
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.bin_path, std::fs::Permissions::from_mode(0o755))
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("Failed to set permissions: {}", e))?;
         }
 
@@ -204,9 +224,13 @@ impl CloudflaredManager {
         self.update_status(|s| {
             s.installed = installed;
             s.version = version.clone();
-        }).await;
+        })
+        .await;
 
-        info!("[cloudflared] Installed successfully, version: {:?}", version);
+        info!(
+            "[cloudflared] Installed successfully, version: {:?}",
+            version
+        );
         Ok(self.get_status().await)
     }
 
@@ -233,37 +257,58 @@ impl CloudflaredManager {
         let local_url = format!("http://localhost:{}", config.port);
         info!("[cloudflared] Starting tunnel to: {}", local_url);
 
-        let mut cmd = Command::new(&self.bin_path);
+        let bin_path = self.current_bin_path();
+        let mut cmd = Command::new(&bin_path);
+
+        // 设置工作目录
+        if let Some(bin_dir) = bin_path.parent() {
+            cmd.current_dir(bin_dir);
+            debug!("[cloudflared] Working directory: {:?}", bin_dir);
+        }
 
         match config.mode {
             TunnelMode::Quick => {
-                cmd.arg("tunnel")
-                    .arg("--url")
-                    .arg(&local_url)
-                    .arg("--no-autoupdate"); // 禁止自动更新避免意外重启
+                cmd.arg("tunnel").arg("--url").arg(&local_url);
+
+                // 注意：--no-autoupdate 参数在较新版本的 cloudflared 中已不被支持，会导致进程立即退出
+                // cmd.arg("--no-autoupdate");
+
                 if config.use_http2 {
                     cmd.arg("--protocol").arg("http2");
                 }
-                cmd.arg("--loglevel").arg("info"); // 输出更多日志便于排查
+
+                // 注意：--loglevel 参数在此上下文中也会导致 Incorrect Usage 错误，故移除以使用默认值
+                // cmd.arg("--loglevel").arg("info");
+
+                info!("[cloudflared] Command args: tunnel --url {} ...", local_url);
             }
             TunnelMode::Auth => {
                 if let Some(token) = &config.token {
-                    cmd.arg("tunnel")
-                        .arg("run")
-                        .arg("--token")
-                        .arg(token)
-                        .arg("--no-autoupdate");
+                    cmd.arg("tunnel").arg("run").arg("--token").arg(token);
+
+                    // 注意：--no-autoupdate 参数不被支持
+                    // cmd.arg("--no-autoupdate");
+
                     if config.use_http2 {
                         cmd.arg("--protocol").arg("http2");
                     }
-                    cmd.arg("--loglevel").arg("info");
+
+                    // 注意：--loglevel 参数不被支持
+                    // cmd.arg("--loglevel").arg("info");
+
+                    info!("[cloudflared] Command args: tunnel run --token [HIDDEN] ...");
                 } else {
                     return Err("Token required for auth mode".to_string());
                 }
             }
         }
 
+        // 恢复管道
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        // CREATE_NO_WINDOW supresses console window on Windows
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
 
         let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn: {}", e))?;
 
@@ -285,7 +330,8 @@ impl CloudflaredManager {
             s.version = version.clone();
             s.running = true;
             s.error = None;
-        }).await;
+        })
+        .await;
 
         // 启动进程监控任务
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -351,6 +397,10 @@ impl CloudflaredManager {
 
     /// 停止隧道
     pub async fn stop(&self) -> Result<CloudflaredStatus, String> {
+        if let Some(tx) = self.shutdown_tx.write().await.take() {
+            let _ = tx.send(());
+        }
+
         let mut proc_lock = self.process.write().await;
         if let Some(mut child) = proc_lock.take() {
             let _ = child.kill().await;
@@ -361,7 +411,8 @@ impl CloudflaredManager {
             s.running = false;
             s.url = None;
             s.error = None;
-        }).await;
+        })
+        .await;
 
         Ok(self.get_status().await)
     }
@@ -395,7 +446,8 @@ where
         let reader = BufReader::new(stream);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            debug!("[cloudflared] {}", line);
+            // 恢复日志级别为 debug，避免污染生产环境日志
+            debug!("[cloudflared output] {}", line);
             if let Some(url) = extract_tunnel_url(&line) {
                 info!("[cloudflared] Tunnel URL: {}", url);
                 let mut s = status_ref.write().await;
@@ -406,9 +458,32 @@ where
 }
 
 /// 从日志行提取隧道URL
+/// 支持两种模式：
+/// 1. 快速隧道：直接提取 .trycloudflare.com URL
+/// 2. 命名隧道：从 ingress 配置中解析 hostname
 fn extract_tunnel_url(line: &str) -> Option<String> {
-    line.split_whitespace()
+    // 快速隧道模式：直接查找 trycloudflare.com URL
+    if let Some(url) = line
+        .split_whitespace()
         .find(|s| s.starts_with("https://") && s.contains(".trycloudflare.com"))
-        .map(|s| s.to_string())
-}
+    {
+        return Some(url.to_string());
+    }
 
+    // 命名隧道模式：从 "Updated to new configuration" 日志中解析 hostname
+    // 日志格式示例：Updated to new configuration config="{\"ingress\":[{\"hostname\":\"api.example.com\", ...}]}"
+    if line.contains("Updated to new configuration") && line.contains("ingress") {
+        // 查找 hostname 字段
+        if let Some(start) = line.find("\\\"hostname\\\":\\\"") {
+            let after_key = &line[start + 15..]; // 跳过 \"hostname\":\" (共15字符)
+            if let Some(end) = after_key.find("\\\"") {
+                let hostname = &after_key[..end];
+                if !hostname.is_empty() {
+                    return Some(format!("https://{}", hostname));
+                }
+            }
+        }
+    }
+
+    None
+}

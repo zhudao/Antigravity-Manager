@@ -1,72 +1,124 @@
 use serde_json::Value;
 
+// loadCodeAssist 端点（fallback order: Daily → Sandbox → Prod）
+//
+// 优先使用官方 IDE 主力集群 Daily，沙箱备用，生产集群兜底。
+const LOAD_PROJECT_ENDPOINTS: [&str; 3] = [
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+];
+
 /// 使用 Antigravity 的 loadCodeAssist API 获取 project_id
 /// 这是获取 cloudaicompanionProject 的正确方式
 pub async fn fetch_project_id(access_token: &str) -> Result<String, String> {
-    // 使用 Sandbox 环境，避免 Prod 环境的 429 错误
-    let url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
-    
     let request_body = serde_json::json!({
         "metadata": {
             "ideType": "ANTIGRAVITY"
         }
     });
-    
-    let client = crate::utils::http::get_client();
-    let response = client
-        .post(url)
-        .bearer_auth(access_token)
-        // .header("Host", "cloudcode-pa.googleapis.com") // 移除 Host header，因为已切换域名
 
-        .header("User-Agent", "antigravity/1.11.9 windows/amd64")
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("loadCodeAssist 请求失败: {}", e))?;
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("loadCodeAssist 返回错误 {}: {}", status, body));
+    let client = crate::utils::http::get_client();
+    let health_tracker = crate::proxy::upstream::client::get_global_endpoint_health();
+    let ordered_endpoints = health_tracker.get_ordered_endpoints(&LOAD_PROJECT_ENDPOINTS);
+    let mut last_error = String::new();
+
+    for (idx, url) in ordered_endpoints.iter().enumerate() {
+        let response = client
+            .post(*url)
+            .timeout(std::time::Duration::from_millis(3000))
+            .bearer_auth(access_token)
+            .header("User-Agent", crate::constants::USER_AGENT.as_str())
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    health_tracker.mark_success(url);
+                    let data: Value = resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("解析响应失败: {}", e))?;
+
+                    if let Some(project_id) =
+                        data.get("cloudaicompanionProject").and_then(|v| v.as_str())
+                    {
+                        if idx > 0 {
+                            tracing::info!(
+                                "loadCodeAssist fetch_project_id fallback succeeded at endpoint #{} ({})",
+                                idx + 1,
+                                url
+                            );
+                        }
+                        return Ok(project_id.to_string());
+                    } else {
+                        return Err("账号无资格获取官方 cloudaicompanionProject".to_string());
+                    }
+                } else {
+                    if crate::proxy::upstream::client::should_try_next_endpoint_for_url(status, url)
+                    {
+                        health_tracker.mark_failure(url);
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+                    last_error = format!("loadCodeAssist [{}] 返回错误 {}: {}", url, status, body);
+                    continue;
+                }
+            }
+            Err(e) => {
+                health_tracker.mark_failure(url);
+                last_error = format!("loadCodeAssist [{}] 请求失败: {}", url, e);
+                continue;
+            }
+        }
     }
-    
-    let data: Value = response.json()
-        .await
-        .map_err(|e| format!("解析响应失败: {}", e))?;
-    
-    // 提取 cloudaicompanionProject
-    if let Some(project_id) = data.get("cloudaicompanionProject")
-        .and_then(|v| v.as_str()) {
-        return Ok(project_id.to_string());
-    }
-    
-    // 如果没有返回 project_id，说明账号无资格，使用内置随机生成逻辑作为兜底
-    let mock_id = generate_mock_project_id();
-    tracing::warn!("账号无资格获取官方 cloudaicompanionProject，将使用随机生成的 Project ID 作为兜底: {}", mock_id);
-    Ok(mock_id)
+
+    Err(if last_error.is_empty() {
+        "loadCodeAssist 所有端点均不可用".to_string()
+    } else {
+        last_error
+    })
 }
 
-/// 生成随机 project_id（当无法从 API 获取时使用）
-/// 格式：{形容词}-{名词}-{5位随机字符}
-pub fn generate_mock_project_id() -> String {
-    use rand::Rng;
-    
-    let adjectives = ["useful", "bright", "swift", "calm", "bold"];
-    let nouns = ["fuze", "wave", "spark", "flow", "core"];
-    
-    let mut rng = rand::thread_rng();
-    let adj = adjectives[rng.gen_range(0..adjectives.len())];
-    let noun = nouns[rng.gen_range(0..nouns.len())];
-    
-    // 生成5位随机字符（base36）
-    let random_num: String = (0..5)
-        .map(|_| {
-            let chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-            let idx = rng.gen_range(0..chars.len());
-            chars.chars().nth(idx).unwrap()
-        })
-        .collect();
-    
-    format!("{}-{}-{}", adj, noun, random_num)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_project_endpoints_dynamic_health_ordering() {
+        let tracker = crate::proxy::upstream::client::EndpointHealthTracker::new(
+            std::time::Duration::from_secs(60),
+        );
+
+        // 默认顺序为 Daily -> Sandbox -> Prod
+        assert_eq!(
+            tracker.get_ordered_endpoints(&LOAD_PROJECT_ENDPOINTS),
+            vec![
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+            ]
+        );
+
+        // 模拟 Daily 故障
+        tracker.mark_failure("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
+        let ordered = tracker.get_ordered_endpoints(&LOAD_PROJECT_ENDPOINTS);
+        assert_eq!(
+            ordered[0],
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist"
+        );
+
+        // 模拟 Sandbox 也故障
+        tracker.mark_failure(
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
+        );
+        let ordered = tracker.get_ordered_endpoints(&LOAD_PROJECT_ENDPOINTS);
+        assert_eq!(
+            ordered[0],
+            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+        );
+    }
 }

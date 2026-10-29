@@ -1,17 +1,27 @@
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, ToggleLeft, ToggleRight, Fingerprint, Sparkles } from 'lucide-react';
-import { Account } from '../../types/account';
-import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../../utils/format';
+import { useMemo, useState } from 'react';
+import { motion } from 'framer-motion';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal } from 'lucide-react';
+import { Account, ActiveClientsStatus, getAccountTier } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
+import { useConfigStore } from '../../stores/useConfigStore';
+import { GroupQuotaCard } from './GroupQuotaCard';
+import { getValidationBlockedStatusLabel } from './accountValidationStatus';
+import { showToast } from '../common/ToastContainer';
+import { releaseAccountQoSJail } from '../../services/accountService';
+import { QoSStatusBadge } from './QoSStatusBadge';
+import { getLiveLimitForModel } from '../../utils/liveLimit';
+import { getGroupQuotaSummaries } from '../../utils/quotaDisplay';
 
 interface AccountCardProps {
     account: Account;
     selected: boolean;
     onSelect: () => void;
     isCurrent: boolean;
+    activeClients?: ActiveClientsStatus;
     isRefreshing: boolean;
     isSwitching?: boolean;
-    onSwitch: () => void;
+    onSwitch: (targetIde?: string) => void;
     onRefresh: () => void;
     onViewDevice: () => void;
     onViewDetails: () => void;
@@ -19,44 +29,94 @@ interface AccountCardProps {
     onDelete: () => void;
     onToggleProxy: () => void;
     onWarmup?: () => void;
+    onUpdateLabel?: (label: string) => void;
+    onViewError: () => void;
 }
 
-
-function AccountCard({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup }: AccountCardProps) {
+function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, activeClients, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountCardProps) {
     const { t } = useTranslation();
-    const geminiProModel = account.quota?.models.find(m => m.name === 'gemini-3-pro-high');
-    const geminiFlashModel = account.quota?.models.find(m => m.name === 'gemini-3-flash');
-    const geminiImageModel = account.quota?.models.find(m => m.name === 'gemini-3-pro-image');
-    const claudeModel = account.quota?.models.find(m => m.name === 'claude-sonnet-4-5-thinking');
+    const { config } = useConfigStore();
     const isDisabled = Boolean(account.disabled);
+    const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
 
-    const getColorClass = (percentage: number) => {
-        const color = getQuotaColor(percentage);
-        switch (color) {
-            case 'success': return 'bg-emerald-500';
-            case 'warning': return 'bg-amber-500';
-            case 'error': return 'bg-rose-500';
-            default: return 'bg-gray-500';
+    // 自定义标签编辑状态
+    const [isEditingLabel, setIsEditingLabel] = useState(false);
+    const [labelInput, setLabelInput] = useState(account.custom_label || '');
+
+    const isClassic = activeClients?.classic_account_id === account.id;
+    const isIde = activeClients?.ide_account_id === account.id;
+    const isAgy = activeClients?.agy_account_id === account.id;
+    const isCurrent = propIsCurrent || isClassic || isIde || isAgy;
+
+    const handleSaveLabel = () => {
+        if (onUpdateLabel) {
+            onUpdateLabel(labelInput.trim());
+        }
+        setIsEditingLabel(false);
+    };
+
+    const handleReleaseJail = async () => {
+        try {
+            await releaseAccountQoSJail(account.id);
+            showToast(t('accounts.qos.release_success', '已解除该账号的小黑屋限制'), 'success');
+            onRefresh();
+        } catch (err: any) {
+            showToast(err?.message || '解除失败', 'error');
         }
     };
 
-    const getTimeColorClass = (resetTime: string | undefined) => {
-        const color = getTimeRemainingColor(resetTime);
-        switch (color) {
-            case 'success': return 'text-emerald-500 dark:text-emerald-400';
-            case 'warning': return 'text-amber-500 dark:text-amber-400';
-            default: return 'text-gray-400 dark:text-gray-500 opacity-60';
+    const handleCancelLabel = () => {
+        setLabelInput(account.custom_label || '');
+        setIsEditingLabel(false);
+    };
+
+    const handleKeyDown = (e: React.KeyboardEvent) => {
+        if (e.key === 'Enter') {
+            handleSaveLabel();
+        } else if (e.key === 'Escape') {
+            handleCancelLabel();
+        }
+    };
+
+    const tier = useMemo(() => getAccountTier(account), [account]);
+    const groupSummaries = useMemo(() => {
+        return getGroupQuotaSummaries(account.quota?.quota_groups, account.quota?.models, tier);
+    }, [account.quota?.quota_groups, account.quota?.models, tier]);
+
+    const modelCapabilities = useMemo(() => {
+        const supported = Array.from(new Set(groupSummaries.flatMap(s => s.supportedModels || [])));
+        const hasArgon = supported.some(m => m.includes('argon')) || groupSummaries.some(s => s.key === 'argon');
+        const hasClaude55 = supported.some(m => m.includes('5-5') || m.includes('5.5'));
+        const hasClaude46 = supported.some(m => m.includes('4-6') || m.includes('4.6'));
+        const hasGpt = supported.some(m => m.startsWith('gpt'));
+        return { hasArgon, hasClaude55, hasClaude46, hasGpt };
+    }, [groupSummaries]);
+
+    const isGroupProtected = (key: 'gemini' | 'claude' | 'argon') => {
+        if (!config?.quota_protection?.enabled) return false;
+        if (!account.protected_models || account.protected_models.length === 0) return false;
+        if (key === 'argon') {
+            return account.protected_models.some(m => m.toLowerCase().includes('argon'));
+        }
+        if (key === 'gemini') {
+            return account.protected_models.some(m => m.toLowerCase().startsWith('gemini') && !m.toLowerCase().includes('argon'));
+        } else {
+            return account.protected_models.some(m => m.toLowerCase().startsWith('claude') || m.toLowerCase().startsWith('gpt'));
         }
     };
 
     return (
-        <div className={cn(
-            "flex flex-col p-3 rounded-xl border transition-all hover:shadow-md",
-            isCurrent
-                ? "bg-blue-50/30 border-blue-200 dark:bg-blue-900/10 dark:border-blue-900/30"
-                : "bg-white dark:bg-base-100 border-gray-200 dark:border-base-300",
-            (isRefreshing || isDisabled) && "opacity-70"
-        )}>
+        <motion.div
+            whileHover={{ y: -2 }}
+            transition={{ duration: 0.15 }}
+            className={cn(
+                "flex flex-col p-3 rounded-xl border transition-all hover:shadow-md",
+                isCurrent
+                    ? "bg-blue-50/30 border-blue-200 dark:bg-blue-900/10 dark:border-blue-900/30"
+                    : "bg-white dark:bg-base-100 border-gray-200 dark:border-base-300",
+                (isRefreshing || isDisabled) && "opacity-70"
+            )}
+        >
 
             {/* Header: Checkbox + Email + Badges */}
             <div className="flex-none flex items-start gap-3 mb-2">
@@ -67,16 +127,40 @@ function AccountCard({ account, selected, onSelect, isCurrent, isRefreshing, isS
                     onChange={() => onSelect()}
                     onClick={(e) => e.stopPropagation()}
                 />
-                <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                        <h3 className={cn(
-                            "font-semibold text-sm truncate",
-                            isCurrent ? "text-blue-700 dark:text-blue-400" : "text-gray-900 dark:text-base-content"
-                        )} title={account.email}>
-                            {account.email}
-                        </h3>
-                        <div className="flex items-center gap-1.5 shrink-0">
-                            {isCurrent && (
+                <div className="flex-1 min-w-0 flex flex-col gap-1.5">
+                    <h3 className={cn(
+                        "font-semibold text-sm truncate w-full",
+                        isCurrent ? "text-blue-700 dark:text-blue-400" : "text-gray-900 dark:text-base-content"
+                    )} title={account.email}>
+                        {account.email}
+                    </h3>
+                    <div className="flex items-center justify-between w-full gap-2">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                            {isClassic && (
+                                <span
+                                    className="px-1.5 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 text-[9px] font-bold shadow-sm border border-blue-200/50"
+                                    title={t('accounts.client_classic_tooltip', '当前 Antigravity 经典款客户端登录账号')}
+                                >
+                                    {t('accounts.client_classic', '经典款')}
+                                </span>
+                            )}
+                            {isIde && (
+                                <span
+                                    className="px-1.5 py-0.5 rounded-md bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300 text-[9px] font-bold shadow-sm border border-sky-200/50"
+                                    title={t('accounts.client_ide_tooltip', '当前 Antigravity IDE 客户端登录账号')}
+                                >
+                                    {t('accounts.client_ide', 'IDE')}
+                                </span>
+                            )}
+                            {isAgy && (
+                                <span
+                                    className="px-1.5 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 text-[9px] font-bold shadow-sm border border-emerald-200/50"
+                                    title={t('accounts.client_cli_tooltip', '当前 Antigravity CLI (agy) 登录账号')}
+                                >
+                                    {t('accounts.client_cli', 'CLI')}
+                                </span>
+                            )}
+                            {!isClassic && !isIde && !isAgy && propIsCurrent && (
                                 <span className="px-1.5 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 text-[9px] font-bold shadow-sm border border-blue-200/50">
                                     {t('accounts.current').toUpperCase()}
                                 </span>
@@ -84,38 +168,48 @@ function AccountCard({ account, selected, onSelect, isCurrent, isRefreshing, isS
                             {isDisabled && (
                                 <span
                                     className="px-1.5 py-0.5 rounded-md bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-rose-200/50"
-                                    title={account.disabled_reason || t('accounts.disabled_tooltip')}
                                 >
                                     <Ban className="w-2.5 h-2.5" />
                                     {t('accounts.disabled').toUpperCase()}
                                 </span>
                             )}
-                            {account.proxy_disabled && (
+                            {account.proxy_disabled && !isDisabled && (
                                 <span
                                     className="px-1.5 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-orange-200/50"
-                                    title={account.proxy_disabled_reason || t('accounts.proxy_disabled_tooltip')}
                                 >
                                     <Ban className="w-2.5 h-2.5" />
                                     {t('accounts.proxy_disabled').toUpperCase()}
                                 </span>
                             )}
                             {account.quota?.is_forbidden && (
-                                <span className="px-1.5 py-0.5 rounded-md bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50" title={t('accounts.forbidden_tooltip')}>
+                                <span className="px-1.5 py-0.5 rounded-md bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50">
                                     <Lock className="w-2.5 h-2.5" />
                                     {t('accounts.forbidden').toUpperCase()}
                                 </span>
                             )}
+                            {account.validation_blocked && (
+                                <span className="px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-amber-200/50">
+                                    <Clock className="w-2.5 h-2.5" />
+                                    {validationBlockedLabel.toUpperCase()}
+                                </span>
+                            )}
+                            <QoSStatusBadge
+                                status={account.qos_status}
+                                resetSeconds={account.qos_reset_seconds}
+                                size="sm"
+                                onRelease={handleReleaseJail}
+                            />
                             {/* 订阅类型徽章 */}
-                            {account.quota?.subscription_tier && (() => {
-                                const tier = account.quota.subscription_tier.toLowerCase();
-                                if (tier.includes('ultra')) {
+                            {(() => {
+                                const tier = getAccountTier(account);
+                                if (tier === 'ultra') {
                                     return (
                                         <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[9px] font-bold shadow-sm">
                                             <Gem className="w-2.5 h-2.5 fill-current" />
                                             ULTRA
                                         </span>
                                     );
-                                } else if (tier.includes('pro')) {
+                                } else if (tier === 'pro') {
                                     return (
                                         <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[9px] font-bold shadow-sm">
                                             <Diamond className="w-2.5 h-2.5 fill-current" />
@@ -131,148 +225,143 @@ function AccountCard({ account, selected, onSelect, isCurrent, isRefreshing, isS
                                     );
                                 }
                             })()}
+                            {/* 自定义标签 */}
+                            <span className="px-1.5 py-0.5 rounded-md bg-gray-100 dark:bg-white/10 text-gray-500 dark:text-gray-400 text-[9px] font-bold" title={t('accounts.priority_hint')}>
+                                {t('accounts.priority')}: {account.priority ?? 50}
+                            </span>
+                            {account.custom_label && (
+                                <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[9px] font-bold shadow-sm border border-orange-200/50 dark:border-orange-800/50">
+                                    <Tag className="w-2.5 h-2.5" />
+                                    {account.custom_label}
+                                </span>
+                            )}
+                            {/* 核心模型能力直观徽章 */}
+                            {modelCapabilities.hasArgon && (
+                                <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-purple-500/15 to-indigo-500/15 text-purple-700 dark:text-purple-300 text-[9px] font-bold border border-purple-200/60 dark:border-purple-800/50"
+                                >
+                                    <Sparkles className="w-2.5 h-2.5 text-purple-500" />
+                                    Argon
+                                </span>
+                            )}
+                            {modelCapabilities.hasClaude55 && (
+                                <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-500/15 text-amber-700 dark:text-amber-300 text-[9px] font-bold border border-amber-200/60 dark:border-amber-800/50"
+                                >
+                                    Claude 5.5
+                                </span>
+                            )}
+                            {modelCapabilities.hasClaude46 && !modelCapabilities.hasClaude55 && (
+                                <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-500/10 text-amber-600/90 dark:text-amber-400/90 text-[9px] font-bold border border-amber-200/40 dark:border-amber-800/30"
+                                >
+                                    Claude 4.6
+                                </span>
+                            )}
+                            {modelCapabilities.hasGpt && (
+                                <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 text-[9px] font-bold border border-emerald-200/60 dark:border-emerald-800/50"
+                                >
+                                    GPT-120B
+                                </span>
+                            )}
                         </div>
+                        <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono shrink-0 whitespace-nowrap">
+                            {new Date(account.last_used * 1000).toLocaleString([], { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                        </span>
                     </div>
                 </div>
             </div>
 
-            {/* Quota Section */}
-            <div className="flex-1 mb-2 space-y-2 overflow-y-auto scrollbar-none">
-                {account.quota?.is_forbidden ? (
-                    <div className="flex items-center gap-2 text-xs text-red-500 dark:text-red-400 bg-red-50/50 dark:bg-red-900/10 p-2 rounded-lg border border-red-100 dark:border-red-900/30">
-                        <Ban className="w-4 h-4 shrink-0" />
-                        <span>{t('accounts.forbidden_msg')}</span>
+
+            {/* 配额展示 (统一分组展示) */}
+            <div className="flex-1 px-1 mb-2 overflow-y-auto scrollbar-none">
+                {isDisabled || account.quota?.is_forbidden || account.validation_blocked ? (
+                    <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 h-full py-4 text-center">
+                        <div className={cn(
+                            "flex items-center gap-1.5",
+                            account.validation_blocked ? "text-amber-600 dark:text-amber-400" : "text-red-600 dark:text-red-400"
+                        )}>
+                            {account.validation_blocked ? <Clock className="w-4 h-4" /> : (isDisabled ? <Ban className="w-4 h-4" /> : <Lock className="w-4 h-4" />)}
+                            <span className="text-[11px] font-bold">
+                                {account.validation_blocked ? validationBlockedLabel : (isDisabled ? t('accounts.status.disabled') : t('accounts.forbidden_msg'))}
+                            </span>
+                        </div>
+                        <div className={cn(
+                            "w-px h-3 hidden sm:block",
+                            account.validation_blocked ? "bg-amber-200 dark:bg-amber-800/50" : "bg-red-200 dark:bg-red-800/50"
+                        )} />
+                        <button
+                            onClick={(e) => { e.stopPropagation(); onViewError(); }}
+                            className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline font-medium"
+                        >
+                            {t('accounts.view_error')}
+                        </button>
                     </div>
                 ) : (
-                    <>
-                        <div className="grid grid-cols-2 gap-1.5">
-                            {/* Gemini Pro */}
-                            <div className="relative h-[26px] flex items-center px-1 rounded-lg overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
-                                {geminiProModel && (
-                                    <div
-                                        className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(geminiProModel.percentage)}`}
-                                        style={{ width: `${geminiProModel.percentage}%` }}
-                                    />
-                                )}
-                                <div className="relative z-10 w-full flex items-center text-[9px] font-mono leading-none whitespace-nowrap">
-                                    <span className="w-[46px] text-gray-500 dark:text-gray-400 font-bold truncate pr-0.5" title="Gemini 3 Pro">G3 Pro</span>
-                                    <div className="flex-1 flex justify-center overflow-hidden">
-                                        {geminiProModel?.reset_time ? (
-                                            <span className={cn("flex items-center gap-0.5 font-medium transition-colors whitespace-nowrap", getTimeColorClass(geminiProModel.reset_time))}>
-                                                <Clock className="w-2.5 h-2.5 shrink-0" />
-                                                {formatTimeRemaining(geminiProModel.reset_time)}
-                                            </span>
-                                        ) : (
-                                            <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                        )}
-                                    </div>
-                                    <span className={cn("w-[30px] text-right font-bold transition-colors shrink-0",
-                                        getQuotaColor(geminiProModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                            getQuotaColor(geminiProModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                    )}>
-                                        {(geminiProModel?.percentage || 0)}%
-                                    </span>
-                                </div>
-                            </div>
-
-                            {/* Gemini Flash */}
-                            <div className="relative h-[26px] flex items-center px-1 rounded-lg overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
-                                {geminiFlashModel && (
-                                    <div
-                                        className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(geminiFlashModel.percentage)}`}
-                                        style={{ width: `${geminiFlashModel.percentage}%` }}
-                                    />
-                                )}
-                                <div className="relative z-10 w-full flex items-center text-[9px] font-mono leading-none whitespace-nowrap">
-                                    <span className="w-[46px] text-gray-500 dark:text-gray-400 font-bold truncate pr-0.5" title="Gemini 3 Flash">G3 Flash</span>
-                                    <div className="flex-1 flex justify-center overflow-hidden">
-                                        {geminiFlashModel?.reset_time ? (
-                                            <span className={cn("flex items-center gap-0.5 font-medium transition-colors whitespace-nowrap", getTimeColorClass(geminiFlashModel.reset_time))}>
-                                                <Clock className="w-2.5 h-2.5 shrink-0" />
-                                                {formatTimeRemaining(geminiFlashModel.reset_time)}
-                                            </span>
-                                        ) : (
-                                            <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                        )}
-                                    </div>
-                                    <span className={cn("w-[30px] text-right font-bold transition-colors shrink-0",
-                                        getQuotaColor(geminiFlashModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                            getQuotaColor(geminiFlashModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                    )}>
-                                        {(geminiFlashModel?.percentage || 0)}%
-                                    </span>
-                                </div>
-                            </div>
-
-                            {/* Gemini Image */}
-                            <div className="relative h-[26px] flex items-center px-1 rounded-lg overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
-                                {geminiImageModel && (
-                                    <div
-                                        className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(geminiImageModel.percentage)}`}
-                                        style={{ width: `${geminiImageModel.percentage}%` }}
-                                    />
-                                )}
-                                <div className="relative z-10 w-full flex items-center text-[9px] font-mono leading-none whitespace-nowrap">
-                                    <span className="w-[46px] text-gray-500 dark:text-gray-400 font-bold truncate pr-0.5" title="Gemini 3 Pro Image">G3 Image</span>
-                                    <div className="flex-1 flex justify-center overflow-hidden">
-                                        {geminiImageModel?.reset_time ? (
-                                            <span className={cn("flex items-center gap-0.5 font-medium transition-colors whitespace-nowrap", getTimeColorClass(geminiImageModel.reset_time))}>
-                                                <Clock className="w-2.5 h-2.5 shrink-0" />
-                                                {formatTimeRemaining(geminiImageModel.reset_time)}
-                                            </span>
-                                        ) : (
-                                            <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                        )}
-                                    </div>
-                                    <span className={cn("w-[30px] text-right font-bold transition-colors shrink-0",
-                                        getQuotaColor(geminiImageModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                            getQuotaColor(geminiImageModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                    )}>
-                                        {(geminiImageModel?.percentage || 0)}%
-                                    </span>
-                                </div>
-                            </div>
-
-                            {/* Claude */}
-                            <div className="relative h-[26px] flex items-center px-1 rounded-lg overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
-                                {claudeModel && (
-                                    <div
-                                        className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(claudeModel.percentage)}`}
-                                        style={{ width: `${claudeModel.percentage}%` }}
-                                    />
-                                )}
-                                <div className="relative z-10 w-full flex items-center text-[9px] font-mono leading-none whitespace-nowrap">
-                                    <span className="w-[46px] text-gray-500 dark:text-gray-400 font-bold truncate pr-0.5" title="Claude-sonnet-4.5">Claude 4.5</span>
-                                    <div className="flex-1 flex justify-center overflow-hidden">
-                                        {claudeModel?.reset_time ? (
-                                            <span className={cn("flex items-center gap-0.5 font-medium transition-colors whitespace-nowrap", getTimeColorClass(claudeModel.reset_time))}>
-                                                <Clock className="w-2.5 h-2.5 shrink-0" />
-                                                {formatTimeRemaining(claudeModel.reset_time)}
-                                            </span>
-                                        ) : (
-                                            <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                        )}
-                                    </div>
-                                    <span className={cn("w-[30px] text-right font-bold transition-colors shrink-0",
-                                        getQuotaColor(claudeModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                            getQuotaColor(claudeModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                    )}>
-                                        {(claudeModel?.percentage || 0)}%
-                                    </span>
-                                </div>
-                            </div>
+                    <div className="flex flex-col gap-1.5 content-start">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            {groupSummaries.filter(s => s.key !== 'argon').map((summary) => (
+                                <GroupQuotaCard
+                                    key={summary.key}
+                                    summary={summary}
+                                    isProtected={isGroupProtected(summary.key)}
+                                    liveLimit={summary.key === 'gemini' ? getLiveLimitForModel(account, 'gemini-pro') : getLiveLimitForModel(account, 'claude')}
+                                />
+                            ))}
                         </div>
-                    </>
+                        {(() => {
+                            const argon = groupSummaries.find(s => s.key === 'argon');
+                            if (!argon) return null;
+                            return (
+                                <div className="w-full">
+                                    <GroupQuotaCard
+                                        summary={argon}
+                                        isProtected={isGroupProtected('argon')}
+                                        liveLimit={getLiveLimitForModel(account, 'gemini-4-argon')}
+                                        fullWidth
+                                    />
+                                </div>
+                            );
+                        })()}
+                    </div>
                 )}
             </div>
 
-            {/* Footer: Actions & Date */}
-            <div className="flex-none flex items-center justify-between pt-2 border-t border-gray-100 dark:border-base-200">
-                <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono">
-                    {new Date(account.last_used * 1000).toLocaleString([], { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
-                </span>
-
-                <div className="flex items-center gap-1">
+            {/* Footer: Actions Only */}
+            <div className="flex-none flex items-center justify-center pt-2 pb-1 border-t border-gray-100 dark:border-base-200">
+                {/* 标签编辑弹出框 */}
+                {isEditingLabel && (
+                    <div className="absolute inset-0 bg-white/95 dark:bg-base-100/95 rounded-xl z-10 flex items-center justify-center p-4">
+                        <div className="flex items-center gap-2 w-full max-w-xs">
+                            <input
+                                type="text"
+                                className="flex-1 px-2 py-1 text-sm border border-orange-300 dark:border-orange-700 rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white dark:bg-base-200"
+                                placeholder={t('accounts.custom_label_placeholder', 'Enter custom label')}
+                                value={labelInput}
+                                onChange={(e) => setLabelInput(e.target.value)}
+                                onKeyDown={handleKeyDown}
+                                autoFocus
+                                maxLength={15}
+                            />
+                            <button
+                                className="p-1.5 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 rounded-lg transition-all"
+                                onClick={handleSaveLabel}
+                                title={t('common.save', 'Save')}
+                            >
+                                <Check className="w-4 h-4" />
+                            </button>
+                            <button
+                                className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-all"
+                                onClick={handleCancelLabel}
+                                title={t('common.cancel', 'Cancel')}
+                            >
+                                <X className="w-4 h-4" />
+                            </button>
+                        </div>
+                    </div>
+                )}
+                <div className="flex flex-wrap items-center justify-center gap-1 w-full">
                     <button
                         className="p-1.5 text-gray-400 hover:text-sky-600 dark:hover:text-sky-400 hover:bg-sky-50 dark:hover:bg-sky-900/30 rounded-lg transition-all"
                         onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
@@ -287,13 +376,44 @@ function AccountCard({ account, selected, onSelect, isCurrent, isRefreshing, isS
                     >
                         <Fingerprint className="w-3.5 h-3.5" />
                     </button>
+                    {/* 自定义标签按钮 */}
+                    {onUpdateLabel && (
+                        <button
+                            className={cn(
+                                "p-1.5 rounded-lg transition-all",
+                                account.custom_label
+                                    ? "text-orange-500 hover:text-orange-600 hover:bg-orange-50 dark:hover:bg-orange-900/30"
+                                    : "text-gray-400 hover:text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-900/30"
+                            )}
+                            onClick={(e) => { e.stopPropagation(); setIsEditingLabel(true); }}
+                            title={t('accounts.edit_label', 'Edit Label')}
+                        >
+                            <Tag className="w-3.5 h-3.5" />
+                        </button>
+                    )}
                     <button
                         className={`p-1.5 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'text-blue-600 bg-blue-50 dark:text-blue-400 dark:bg-blue-900/10 cursor-not-allowed' : 'text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onSwitch(); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('common.switch'))}
+                        onClick={(e) => { e.stopPropagation(); onSwitch('classic'); }}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_classic', '切换到 Antigravity (经典版)'))}
                         disabled={isSwitching || isDisabled}
                     >
                         <ArrowRightLeft className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
+                    </button>
+                    <button
+                        className={`p-1.5 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'text-blue-600 bg-blue-50 dark:text-blue-400 dark:bg-blue-900/10 cursor-not-allowed' : 'text-gray-400 hover:text-sky-600 dark:hover:text-sky-400 hover:bg-sky-50 dark:hover:bg-sky-900/30'}`}
+                        onClick={(e) => { e.stopPropagation(); onSwitch('ide'); }}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_ide', '切换到 Antigravity IDE'))}
+                        disabled={isSwitching || isDisabled}
+                    >
+                        <Repeat2 className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
+                    </button>
+                    <button
+                        className={`p-1.5 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'text-blue-600 bg-blue-50 dark:text-blue-400 dark:bg-blue-900/10 cursor-not-allowed' : 'text-gray-400 hover:text-emerald-600 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/30'}`}
+                        onClick={(e) => { e.stopPropagation(); onSwitch('agy'); }}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_agy', '切换到 Antigravity CLI (agy)'))}
+                        disabled={isSwitching || isDisabled}
+                    >
+                        <Terminal className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
                     </button>
                     {onWarmup && (
                         <button
@@ -339,7 +459,7 @@ function AccountCard({ account, selected, onSelect, isCurrent, isRefreshing, isS
                         )}
                     </button>
                     <button
-                        className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                        className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-all"
                         onClick={(e) => { e.stopPropagation(); onDelete(); }}
                         title={t('common.delete')}
                     >
@@ -347,7 +467,7 @@ function AccountCard({ account, selected, onSelect, isCurrent, isRefreshing, isS
                     </button>
                 </div>
             </div>
-        </div >
+        </motion.div>
     );
 }
 

@@ -1,6 +1,6 @@
-use tauri::State;
 use crate::modules::cloudflared::{CloudflaredConfig, CloudflaredManager, CloudflaredStatus};
 use std::sync::Arc;
+use tauri::State;
 use tokio::sync::RwLock;
 
 /// Cloudflared服务状态管理
@@ -25,6 +25,17 @@ impl CloudflaredState {
         }
         Ok(())
     }
+
+    /// 停止隧道（如果已初始化）
+    pub async fn stop(&self) -> Result<Option<CloudflaredStatus>, String> {
+        let lock = self.manager.read().await;
+        if let Some(manager) = lock.as_ref() {
+            let status = manager.stop().await?;
+            Ok(Some(status))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// 检查cloudflared是否已安装
@@ -33,7 +44,7 @@ pub async fn cloudflared_check(
     state: State<'_, CloudflaredState>,
 ) -> Result<CloudflaredStatus, String> {
     state.ensure_manager().await?;
-    
+
     let lock = state.manager.read().await;
     if let Some(manager) = lock.as_ref() {
         let (installed, version) = manager.check_installed().await;
@@ -55,7 +66,7 @@ pub async fn cloudflared_install(
     state: State<'_, CloudflaredState>,
 ) -> Result<CloudflaredStatus, String> {
     state.ensure_manager().await?;
-    
+
     let lock = state.manager.read().await;
     if let Some(manager) = lock.as_ref() {
         manager.install().await
@@ -71,7 +82,7 @@ pub async fn cloudflared_start(
     config: CloudflaredConfig,
 ) -> Result<CloudflaredStatus, String> {
     state.ensure_manager().await?;
-    
+
     let lock = state.manager.read().await;
     if let Some(manager) = lock.as_ref() {
         manager.start(config).await
@@ -86,7 +97,7 @@ pub async fn cloudflared_stop(
     state: State<'_, CloudflaredState>,
 ) -> Result<CloudflaredStatus, String> {
     state.ensure_manager().await?;
-    
+
     let lock = state.manager.read().await;
     if let Some(manager) = lock.as_ref() {
         manager.stop().await
@@ -117,4 +128,3 @@ pub async fn cloudflared_get_status(
         Ok(CloudflaredStatus::default())
     }
 }
-

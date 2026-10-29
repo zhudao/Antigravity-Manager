@@ -1,8 +1,11 @@
 import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, ToggleLeft, ToggleRight, Fingerprint } from 'lucide-react';
-import { Account } from '../../types/account';
+import { Account, getAccountTier } from '../../types/account';
 import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../../utils/format';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
+import { formatCompactDuration, getLiveLimitForModel, getLiveLimitState } from '../../utils/liveLimit';
+import { getModelProtectionKey, findQuotaModel, findImageQuotaModel } from '../../config/modelConfig';
+import { QoSStatusBadge } from './QoSStatusBadge';
 
 interface AccountRowProps {
     account: Account;
@@ -11,7 +14,7 @@ interface AccountRowProps {
     isCurrent: boolean;
     isRefreshing: boolean;
     isSwitching?: boolean;
-    onSwitch: () => void;
+    onSwitch: (targetIde?: string) => void;
     onRefresh: () => void;
     onViewDevice: () => void;
     onViewDetails: () => void;
@@ -24,10 +27,27 @@ interface AccountRowProps {
 
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice }: AccountRowProps) {
     const { t } = useTranslation();
-    const geminiProModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-pro-high');
-    const geminiFlashModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-flash');
-    const geminiImageModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-pro-image');
-    const claudeModel = account.quota?.models.find(m => m.name.toLowerCase() === 'claude-sonnet-4-5-thinking');
+    // [重构] 按优先级查找配额模型
+    const geminiProModel = findQuotaModel(account.quota?.models, 'gemini-pro');
+    const geminiFlashModel = findQuotaModel(account.quota?.models, 'gemini-flash');
+
+    const geminiImageModel = findImageQuotaModel(account.quota?.models);
+    const imageProtectionKey = getModelProtectionKey(geminiImageModel?.name || '');
+    const liveImageLimit = getLiveLimitForModel(account, geminiImageModel?.name, imageProtectionKey ?? undefined);
+    const liveImageState = getLiveLimitState(liveImageLimit);
+    const isImageLiveLimited = liveImageState.shouldShow;
+    const imageLimitTitle = liveImageLimit
+        ? [
+            liveImageState.isActive
+                ? `Live image endpoint is temporarily unavailable for ${formatCompactDuration(liveImageState.secondsRemaining)}.`
+                : `Image endpoint returned ${liveImageLimit.status} ${formatCompactDuration(liveImageState.secondsAgo)} ago.`,
+            `Reason: ${liveImageLimit.reason}.`,
+            `Quota snapshot can still show ${geminiImageModel?.percentage || 0}%.`,
+            liveImageLimit.message ? `Message: ${liveImageLimit.message}` : null,
+        ].filter(Boolean).join(' ')
+        : 'Gemini 3.1 Flash Image';
+
+    const claudeModel = findQuotaModel(account.quota?.models, 'claude');
     const isDisabled = Boolean(account.disabled);
 
     // 颜色映射，避免动态类名被 Tailwind purge
@@ -46,7 +66,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
         switch (color) {
             case 'success': return 'text-emerald-500 dark:text-emerald-400';
             case 'warning': return 'text-amber-500 dark:text-amber-400';
-            default: return 'text-gray-400 dark:text-gray-500 opacity-60';
+            default: return 'text-blue-600 dark:text-blue-400';
         }
     };
 
@@ -94,7 +114,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             </span>
                         )}
 
-                        {account.proxy_disabled && (
+                        {account.proxy_disabled && !isDisabled && (
                             <span
                                 className="px-2 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/50 text-orange-700 dark:text-orange-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-orange-200/50"
                                 title={account.proxy_disabled_reason || t('accounts.proxy_disabled_tooltip')}
@@ -111,17 +131,19 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             </span>
                         )}
 
+                        <QoSStatusBadge status={account.qos_status} size="md" />
+
                         {/* 订阅类型徽章 */}
-                        {account.quota?.subscription_tier && (() => {
-                            const tier = account.quota.subscription_tier.toLowerCase();
-                            if (tier.includes('ultra')) {
+                        {(() => {
+                            const tier = getAccountTier(account);
+                            if (tier === 'ultra') {
                                 return (
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Gem className="w-2.5 h-2.5 fill-current" />
                                         ULTRA
                                     </span>
                                 );
-                            } else if (tier.includes('pro')) {
+                            } else if (tier === 'pro') {
                                 return (
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Diamond className="w-2.5 h-2.5 fill-current" />
@@ -151,7 +173,11 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 ) : (
                     <div className="grid grid-cols-2 gap-x-4 gap-y-1 py-0">
                         {/* Gemini Pro */}
-                        <div className="relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
+                        <div className={cn(
+                            "relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota",
+                            isImageLiveLimited && "border-amber-400/70 dark:border-amber-500/70 bg-amber-50/80 dark:bg-amber-950/30 ring-1 ring-amber-400/30",
+                            liveImageState.isActive && "border-rose-400/70 dark:border-rose-500/70 bg-rose-50/80 dark:bg-rose-950/30 ring-rose-400/30"
+                        )}>
                             {geminiProModel && (
                                 <div
                                     className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(geminiProModel.percentage)}`}
@@ -159,7 +185,10 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                 />
                             )}
                             <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[54px] text-gray-500 dark:text-gray-400 font-bold truncate pr-1" title="Gemini 3 Pro">G3 Pro</span>
+                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Gemini 3.1 Pro">
+                                    {(account.protected_models?.includes('gemini-3-pro-high') || account.protected_models?.includes('gemini-3.1-pro-high')) && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                    <span className="truncate">G3.1 Pro</span>
+                                </span>
                                 <div className="flex-1 flex justify-center">
                                     {geminiProModel?.reset_time ? (
                                         <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(geminiProModel.reset_time))}>
@@ -188,7 +217,10 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                 />
                             )}
                             <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[54px] text-gray-500 dark:text-gray-400 font-bold truncate pr-1" title="Gemini 3 Flash">G3 Flash</span>
+                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Gemini 3 Flash">
+                                    {account.protected_models?.includes('gemini-3-flash') && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                    <span className="truncate">G3 Flash</span>
+                                </span>
                                 <div className="flex-1 flex justify-center">
                                     {geminiFlashModel?.reset_time ? (
                                         <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(geminiFlashModel.reset_time))}>
@@ -217,7 +249,11 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                 />
                             )}
                             <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[54px] text-gray-500 dark:text-gray-400 font-bold truncate pr-1" title="Gemini 3 Pro Image">G3 Image</span>
+                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title={imageLimitTitle}>
+                                    {isImageLiveLimited && <Clock className={cn("w-2.5 h-2.5 shrink-0 z-10", liveImageState.isActive ? "text-rose-500" : "text-amber-500")} />}
+                                    {(imageProtectionKey && account.protected_models?.includes(imageProtectionKey)) && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                    <span className="truncate">G3 Image</span>
+                                </span>
                                 <div className="flex-1 flex justify-center">
                                     {geminiImageModel?.reset_time ? (
                                         <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(geminiImageModel.reset_time))}>
@@ -229,10 +265,11 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                     )}
                                 </div>
                                 <span className={cn("w-[36px] text-right font-bold transition-colors",
-                                    getQuotaColor(geminiImageModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
+                                    isImageLiveLimited ? (liveImageState.isActive ? 'text-rose-600 dark:text-rose-400' : 'text-amber-600 dark:text-amber-400') :
+                                        getQuotaColor(geminiImageModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
                                         getQuotaColor(geminiImageModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
                                 )}>
-                                    {geminiImageModel ? `${geminiImageModel.percentage}%` : '-'}
+                                    {isImageLiveLimited ? `${liveImageLimit?.status || 'ERR'}` : (geminiImageModel ? `${geminiImageModel.percentage}%` : '-')}
                                 </span>
                             </div>
                         </div>
@@ -246,7 +283,10 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                 />
                             )}
                             <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[54px] text-gray-500 dark:text-gray-400 font-bold truncate pr-1" title="Claude-sonnet-4.5">Claude 4.5</span>
+                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Claude Series">
+                                    {account.protected_models?.includes('claude') && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                    <span className="truncate">Claude</span>
+                                </span>
                                 <div className="flex-1 flex justify-center">
                                     {claudeModel?.reset_time ? (
                                         <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(claudeModel.reset_time))}>
@@ -300,7 +340,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                     </button>
                     <button
                         className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onSwitch(); }}
+                        onClick={(e) => { e.stopPropagation(); onSwitch('classic'); }}
                         title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to'))}
                         disabled={isSwitching || isDisabled}
                     >
